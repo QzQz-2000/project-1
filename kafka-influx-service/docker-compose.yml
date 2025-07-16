@@ -1,0 +1,12 @@
+services:
+  kafka-influx-service:
+    build: .
+    restart: always
+    env_file:
+      - .env
+    networks:
+      - my-shared-network
+
+networks:
+  my-shared-network:
+    external: true

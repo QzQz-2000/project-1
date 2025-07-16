@@ -1,0 +1,22 @@
+[tool.poetry]
+name = "digital twin"
+version = "0.1.0"
+description = ""
+authors = ["QzQz-2000 <18822153516@163.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.12"
+fastapi = "^0.115.12"
+uvicorn = "^0.34.3"
+python-multipart = "^0.0.20"
+motor = "^3.7.1"
+pandas = "^2.3.0"
+pydantic-settings = "^2.10.1"
+influxdb-client = "^1.49.0"
+scikit-learn = "^1.7.0"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
