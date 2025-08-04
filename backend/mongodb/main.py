@@ -4,10 +4,13 @@ import re
 import json
 import logging
 import yaml
+import hashlib
+from abc import ABC, abstractmethod
 from datetime import datetime
-from typing import Optional, List, Dict, Any, Union, Set
+from typing import Optional, List, Dict, Any, Union, Set, TypeVar, Generic
 from enum import Enum
 from contextlib import asynccontextmanager
+from functools import lru_cache
 
 # FastAPI 相关
 from fastapi import (
@@ -19,1501 +22,1721 @@ from fastapi import (
     Form,
     HTTPException,
     Query,
-    Depends
+    Depends,
+    Path,
+    Body
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
-from fastapi import APIRouter # <-- 新增导入 APIRouter
+from fastapi import APIRouter
 
 # Pydantic 配置
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, validator
 from pydantic_settings import BaseSettings
 
 # 数据库驱动
 from pymongo.errors import DuplicateKeyError
-from motor.motor_asyncio import AsyncIOMotorClient
-from pymongo import DESCENDING # <-- 新增导入 DESCENDING，用于排序
+from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
+from pymongo import DESCENDING, IndexModel
 from neo4j import AsyncGraphDatabase
 from neo4j.exceptions import Neo4jError
 from influxdb_client import InfluxDBClient
-
-# Kafka 异步生产者
+from influxdb_client.client.write_api import SYNCHRONOUS
 from aiokafka import AIOKafkaProducer
 
-# 加载配置文件，配置logging
-from dotenv import load_dotenv # <-- 确保导入 load_dotenv
+from dotenv import load_dotenv
+
 load_dotenv()
-logging.basicConfig(level=logging.INFO)
+
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 # --- Settings ---
 class Settings(BaseSettings):
-    MONGO_URI: str = Field(os.getenv("MONGO_URI", "mongodb://localhost:27017"))
-    NEO4J_URI: str = Field(os.getenv("NEO4J_URI", "bolt://localhost:7687"))
-    NEO4J_USER: str = Field(os.getenv("NEO4J_USER", "neo4j"))
-    NEO4J_PASSWORD: str = Field(os.getenv("NEO4J_PASSWORD", "password"))
-    KAFKA_BROKER: str = Field(os.getenv("KAFKA_BROKER", "localhost:9092"))
-    INFLUXDB_URL: str = Field(os.getenv("INFLUXDB_URL", "http://localhost:8086"))
-    INFLUXDB_TOKEN: str = Field(os.getenv("INFLUXDB_TOKEN", "my-token"))
-    INFLUXDB_ORG: str = Field(os.getenv("INFLUXDB_ORG", "my-org"))
-    INFLUXDB_BUCKET: str = Field(os.getenv("INFLUXDB_BUCKET", "my-bucket"))
+    # Database connections
+    MONGO_URI: str = Field(default="mongodb://localhost:27017")
+    MONGO_DB_NAME: str = Field(default="digital_twin_db")
+    
+    NEO4J_URI: str = Field(default="bolt://localhost:7687")
+    NEO4J_USER: str = Field(default="neo4j")
+    NEO4J_PASSWORD: str = Field(default="password")
+    
+    KAFKA_BROKER: str = Field(default="localhost:9092")
+    
+    INFLUXDB_URL: str = Field(default="http://localhost:8086")
+    INFLUXDB_TOKEN: str = Field(default="mytoken")
+    INFLUXDB_ORG: str = Field(default="myorg")
+    INFLUXDB_BUCKET: str = Field(default="mybucket")
+    
+    # API settings
+    API_TITLE: str = Field(default="Digital Twin Platform API")
+    API_VERSION: str = Field(default="0.2.0")
+    
+    # Performance settings
+    DEFAULT_PAGE_SIZE: int = Field(default=100)
+    MAX_PAGE_SIZE: int = Field(default=1000)
+    
+    class Config:
+        env_file = ".env"
 
 settings = Settings()
 
-# --- Global Regex for Relationship Names ---
 REL_NAME_PATTERN = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
-app = FastAPI(title="Digital Twin Platform API", version="0.1.0")
-
-# --- CORS Middleware ---
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # 允许所有来源，生产环境应限制为特定域名
-    allow_credentials=True,
-    allow_methods=["*"],  # 允许所有 HTTP 方法 (GET, POST, PUT, DELETE, etc.)
-    allow_headers=["*"],  # 允许所有 HTTP 头
-)
-
-# --- App Clients ---
-class AppClients:
-    mongo: AsyncIOMotorClient = None
-    neo4j: AsyncGraphDatabase = None # <-- 修正：使用 AsyncGraphDatabase
-    kafka_producer: AIOKafkaProducer = None
-    influxdb_client: InfluxDBClient = None # 确保类型正确
-
-# --- Database & Client Initialization/Shutdown ---
-@app.on_event("startup")
-async def startup_db_client():
-    """Initializes MongoDB, Neo4j, Kafka, and InfluxDB clients on app startup."""
-    try:
-        # MongoDB 数据库连接
-        app.state.clients = AppClients()
-        app.state.clients.mongo = AsyncIOMotorClient(settings.MONGO_URI)
-        await app.state.clients.mongo.admin.command('ping')
-        logger.info("Connected to MongoDB.")
-
-        # 创建 MongoDB 索引 (确保唯一性)
-        await app.state.clients.mongo["digital_twin_db"]["environments"].create_index(
-            "environment_id", unique=True
-        )
-        await app.state.clients.mongo["digital_twin_db"]["models"].create_index(
-            [("environment_id", 1), ("model_id", 1)], unique=True
-        )
-        await app.state.clients.mongo["digital_twin_db"]["twins"].create_index(
-            [("environment_id", 1), ("twin_id", 1)], unique=True
-        )
-        await app.state.clients.mongo["digital_twin_db"]["devices"].create_index(
-            [("environment_id", 1), ("device_id", 1)], unique=True
-        )
-        await app.state.clients.mongo["digital_twin_db"]["workflows"].create_index(
-            [("environment_id", 1), ("workflow_id", 1)], unique=True
-        )
-        logger.info("MongoDB indexes created/ensured.")
-
-        # Neo4j 数据库连接
-        app.state.clients.neo4j = AsyncGraphDatabase.driver( # <-- 修正：使用 AsyncGraphDatabase.driver
-            settings.NEO4J_URI,
-            auth=(settings.NEO4J_USER, settings.NEO4J_PASSWORD)
-        )
-        await app.state.clients.neo4j.verify_connectivity()
-        logger.info("Connected to Neo4j.")
-
-        # 创建 Neo4j 约束 (确保是异步调用)
-        async def create_neo4j_constraint_async(driver: AsyncGraphDatabase, query: str): # <-- 修正：改为异步函数
-            """Helper to create Neo4j constraints asynchronously."""
-            try:
-                async with driver.session() as session: # <-- 修正：使用异步 session
-                    await session.run(query) # <-- 修正：await run
-                    logger.info(f"Neo4j constraint created: {query}")
-            except Neo4jError as e:
-                if "already exists" in str(e):
-                    logger.warning(f"Neo4j constraint already exists: {query}")
-                else:
-                    logger.error(f"Failed to create Neo4j constraint {query}: {e}", exc_info=True)
-                    raise
-
-        # Twin 节点的唯一性约束
-        await create_neo4j_constraint_async(app.state.clients.neo4j, "CREATE CONSTRAINT twin_id_unique IF NOT EXISTS FOR (t:Twin) REQUIRE t.twin_id IS UNIQUE")
-        # 再次提示：`ASSERT t.environment_id IS UNIQUE` 这个约束在多环境、多孪生的场景下通常是不合理的。
-        # 如果需要确保 twin_id 在某个 environment_id 下唯一，则需要在应用层逻辑中处理，或者使用组合唯一性约束 (不支持直接在 Neo4j 中)。
-        # 这里仅作演示，如果您确定 environment_id 对 Twin 节点是全局唯一的，则保留。
-        # 否则，请考虑移除或修改此行。
-        await create_neo4j_constraint_async(app.state.clients.neo4j, "CREATE CONSTRAINT twin_environment_id_unique IF NOT EXISTS FOR (t:Twin) REQUIRE t.environment_id IS UNIQUE") # <-- 请根据您的业务逻辑确认此约束是否合理
-
-        # Kafka 生产者初始化
-        app.state.clients.kafka_producer = AIOKafkaProducer(bootstrap_servers=settings.KAFKA_BROKER)
-        await app.state.clients.kafka_producer.start()
-        logger.info("Connected to Kafka.")
-
-        # InfluxDB 客户端初始化
-        app.state.clients.influxdb_client = InfluxDBClient(
-            url=settings.INFLUXDB_URL,
-            token=settings.INFLUXDB_TOKEN,
-            org=settings.INFLUXDB_ORG
-        )
-        app.state.clients.influxdb_client.ping()
-        logger.info("Connected to InfluxDB.")
-
-    except Exception as e:
-        logger.critical(f"Failed to connect to one or more clients: {e}", exc_info=True)
-        # 确保在连接失败时优雅关闭已建立的连接
-        await shutdown_db_client()
-        raise
-
-@app.on_event("shutdown")
-async def shutdown_db_client():
-    """Closes all database and client connections on app shutdown."""
-    if app.state.clients.mongo:
-        app.state.clients.mongo.close()
-        logger.info("MongoDB connection closed.")
-    if app.state.clients.neo4j:
-        await app.state.clients.neo4j.close() # <-- 修正：使用 await 关闭异步驱动
-        logger.info("Neo4j connection closed.")
-    if app.state.clients.kafka_producer:
-        await app.state.clients.kafka_producer.stop()
-        logger.info("Kafka producer stopped.")
-    if app.state.clients.influxdb_client:
-        app.state.clients.influxdb_client.close()
-        logger.info("InfluxDB client closed.")
-
-# --- Helper Function ---
-def remove_mongo_id(data: Dict[str, Any]) -> Dict[str, Any]:
-    """Removes the '_id' field from a dictionary."""
-    if '_id' in data:
-        copied_data = data.copy()
-        copied_data.pop('_id')
-        return copied_data
-    return data
-
-# --- Base Schema for common fields ---
-class BaseSchema(BaseModel):
+class TimestampMixin(BaseModel):
+    """Mixin for adding timestamp fields to models."""
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
+    
     class Config:
-        json_encoders = {datetime: lambda v: v.isoformat() + "Z"}
-        populate_by_name = True # Allow population by field name or alias
+        json_encoders = {
+            datetime: lambda v: v.isoformat() + "Z"
+        }
+        populate_by_name = True
+
     def model_dump_mongo(self, **kwargs) -> Dict[str, Any]:
+        """Convert model to MongoDB-compatible dictionary."""
         data = self.model_dump(**kwargs)
-        for field in ['created_at', 'updated_at']:
-            if isinstance(data.get(field), datetime):
+        # Ensure datetime fields are properly formatted
+        for field in ['created_at', 'updated_at', 'last_executed', 'telemetry_last_updated']:
+            if field in data and isinstance(data[field], datetime):
                 data[field] = data[field].isoformat() + "Z"
         return data
 
-# --- Environment Schemas ---
-class EnvironmentModel(BaseSchema):
-    environment_id: str
-    display_name: str
-    description: Optional[str] = None
+# --- Utility Functions ---
+def remove_mongo_id(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Remove MongoDB _id field from dictionary."""
+    return {k: v for k, v in data.items() if k != '_id'}
 
-class EnvironmentCreateRequest(BaseModel):
-    environment_id: str
-    display_name: str
-    description: Optional[str] = None
+def validate_identifier(identifier: str, field_name: str) -> str:
+    """Validate identifier format."""
+    if not re.match(r"^[a-zA-Z0-9_-]+$", identifier):
+        raise ValueError(f"{field_name} must contain only alphanumeric characters, hyphens, and underscores")
+    if len(identifier) < 3 or len(identifier) > 50:
+        raise ValueError(f"{field_name} must be between 3 and 50 characters")
+    return identifier
 
-class EnvironmentUpdateRequest(BaseModel):
-    display_name: Optional[str] = None
-    description: Optional[str] = None
-
-# --- Model Schemas ---
 class PropertyType(str, Enum):
     STRING = "string"
     NUMBER = "number"
     BOOLEAN = "boolean"
+    OBJECT = "object"
+    ARRAY = "array"
 
+# TODO: workflow的要不要在这定义还待定
+class WorkflowStatus(str, Enum):
+    ACTIVE = "active"
+    INACTIVE = "inactive"
+    ERROR = "error"
+    DRAFT = "draft"
+
+class WorkflowType(str, Enum):
+    AUTOMATION = "automation"
+    DATA_PROCESSING = "data_processing"
+    MONITORING = "monitoring"
+    CUSTOM = "custom"
+
+# TODO: 是否保留限制条件待定
 class PropertyDefinition(BaseModel):
     type: PropertyType
     unit: Optional[str] = None
     description: Optional[str] = None
     is_required: bool = False
+    default_value: Optional[Any] = None
+    constraints: Optional[Dict[str, Any]] = None  # min, max, pattern, etc.
 
-class RelationshipDefinition(BaseModel):
-    target_model_id: str
+class EnvironmentCreate(BaseModel):
+    environment_id: str
+    display_name: str
     description: Optional[str] = None
-    min_cardinality: int = 0
-    max_cardinality: Optional[int] = None
+    
+    @validator('environment_id')
+    def validate_environment_id(cls, v):
+        return validate_identifier(v, 'environment_id')
 
-# --- 修正后的 ModelSchema (删除了重复定义) ---
-class ModelSchema(BaseSchema):
+class EnvironmentUpdate(BaseModel):
+    display_name: Optional[str] = None
+    description: Optional[str] = None
+
+class Environment(TimestampMixin):
+    environment_id: str
+    display_name: str
+    description: Optional[str] = None
+
+class ModelCreate(BaseModel):
+    model_id: str
+    display_name: str
+    description: Optional[str] = None
+    properties: Dict[str, PropertyDefinition] = Field(default_factory=dict)
+    
+    @validator('model_id')
+    def validate_model_id(cls, v):
+        return validate_identifier(v, 'model_id')
+
+class ModelUpdate(BaseModel):
+    description: Optional[str] = None
+
+class Model(TimestampMixin):
     model_id: str
     environment_id: str
     display_name: str
     description: Optional[str] = None
     properties: Dict[str, PropertyDefinition] = Field(default_factory=dict)
-    relationships: Dict[str, RelationshipDefinition] = Field(default_factory=dict)
-    telemetry: Dict[str, Any] = Field(default_factory=dict)
-    commands: Dict[str, Any] = Field(default_factory=dict)
 
-# --- Twin Schemas ---
-# --- 修正后的 TwinSchema (删除了重复定义) ---
-class TwinSchema(BaseSchema):
-    twin_id: str
-    environment_id: str
-    model_id: str
-    properties: Optional[Dict[str, Any]] = Field(default_factory=dict)
-    telemetry_last_updated: Optional[datetime] = None # 假设 TwinSchema 确实有这个字段
-
-# --- 修正后的 TwinCreateRequest (删除了重复定义) ---
-class TwinCreateRequest(BaseModel):
+class TwinCreate(BaseModel):
     twin_id: str
     model_id: str
     properties: Optional[Dict[str, Any]] = Field(default_factory=dict)
+    
+    @validator('twin_id')
+    def validate_twin_id(cls, v):
+        return validate_identifier(v, 'twin_id')
 
-# --- 修正后的 TwinUpdateRequest (删除了重复定义) ---
-class TwinUpdateRequest(BaseModel):
-    # display_name: Optional[str] = None # <-- 请检查 TwinSchema 是否有 display_name，若无则此字段多余
-    properties: Optional[Dict[str, Any]] = Field(default_factory=dict)
-    telemetry_last_updated: Optional[datetime] = None # 假设 TwinUpdateRequest 确实有这个字段
+# TODO: twin
+class TwinUpdate(BaseModel):
+    properties: Optional[Dict[str, Any]] = None
+    telemetry_last_updated: Optional[datetime] = None
 
-# --- Device Schemas ---
-class DeviceModel(BaseSchema):
-    device_id: str
+class Twin(TimestampMixin):
+    twin_id: str
     environment_id: str
-    display_name: str
-    description: Optional[str] = None
-    properties: Optional[Dict[str, Any]] = Field(default_factory=dict)
+    model_id: str
+    properties: Dict[str, Any] = Field(default_factory=dict)
+    telemetry_last_updated: Optional[datetime] = None
 
-class DeviceCreateRequest(BaseModel):
+class DeviceCreate(BaseModel):
     device_id: str
     display_name: str
     description: Optional[str] = None
-    properties: Optional[Dict[str, Any]] = Field(default_factory=dict)
+    
+    @validator('device_id')
+    def validate_device_id(cls, v):
+        return validate_identifier(v, 'device_id')
 
-class DeviceUpdateRequest(BaseModel):
+class DeviceUpdate(BaseModel):
     display_name: Optional[str] = None
     description: Optional[str] = None
-    properties: Optional[Dict[str, Any]] = Field(default_factory=dict)
 
-# --- Relationship Schemas ---
-class RelationshipModel(BaseSchema):
-    source_twin_id: str
-    target_twin_id: str
-    relationship_name: str
-    environment_id: str
-
-class RelationshipCreateRequest(BaseModel):
-    source_twin_id: str
-    target_twin_id: str
-    relationship_name: str
-
-# --- Telemetry Schema ---
-# --- 修正后的 Telemetry Schema (移除了冗余的 Config) ---
-class Telemetry(BaseModel):
+class Device(TimestampMixin):
     device_id: str
     environment_id: str
-    location: Optional[str]
-    properties: Dict[str, Union[float, int, str, bool]]
+    display_name: str
+    description: Optional[str] = None
+    properties: Dict[str, Any] = Field(default_factory=dict)
+    # Statistics
+    telemetry_points_count: int = 0
 
-# --- Workflow Schemas ---
-class WorkflowSchema(BaseSchema):
-    workflow_id: str
+class RelationshipCreate(BaseModel):
+    source_twin_id: str
+    target_twin_id: str
+    relationship_name: str
+    
+    @validator('relationship_name')
+    def validate_relationship_name(cls, v):
+        if not REL_NAME_PATTERN.match(v):
+            raise ValueError("Relationship name must contain only letters, numbers, and underscores, and start with a letter")
+        return v
+
+class Relationship(TimestampMixin):
+    source_twin_id: str
+    target_twin_id: str
+    relationship_name: str
     environment_id: str
-    file_name: str
-    content: str # Store YAML content as string
-    is_active: bool = False
 
-class WorkflowUploadRequest(BaseModel):
+class WorkflowCreate(BaseModel):
     workflow_id: str
     file_name: str
     content: str
+    workflow_type: WorkflowType = WorkflowType.CUSTOM
+    description: Optional[str] = None
+    tags: List[str] = Field(default_factory=list)
+    
+    @validator('workflow_id')
+    def validate_workflow_id(cls, v):
+        return validate_identifier(v, 'workflow_id')
 
-class WorkflowViewResponse(BaseModel):
+class WorkflowUpdate(BaseModel):
+    file_name: Optional[str] = None
+    content: Optional[str] = None
+    workflow_type: Optional[WorkflowType] = None
+    status: Optional[WorkflowStatus] = None
+    description: Optional[str] = None
+    tags: Optional[List[str]] = None
+    version: Optional[str] = None
+
+class Workflow(TimestampMixin):
     workflow_id: str
+    environment_id: str
     file_name: str
-    content: str # Return content as string for viewing
+    content: str
+    workflow_type: WorkflowType = WorkflowType.CUSTOM
+    status: WorkflowStatus = WorkflowStatus.DRAFT
+    description: Optional[str] = None
+    version: str = "1.0.0"
+    tags: List[str] = Field(default_factory=list)
+    # Execution statistics
+    last_executed: Optional[datetime] = None
+    execution_count: int = 0
+    # Metadata
+    file_size: int = 0
+    checksum: str = ""
 
-class WorkflowListResponse(BaseModel):
-    workflows: List[WorkflowSchema]
+class WorkflowSummary(BaseModel):
+    """Workflow summary for list views (without content)."""
+    workflow_id: str
+    environment_id: str
+    file_name: str
+    workflow_type: WorkflowType
+    status: WorkflowStatus
+    description: Optional[str] = None
+    version: str
+    tags: List[str]
+    created_at: datetime
+    updated_at: datetime
+    last_executed: Optional[datetime] = None
+    execution_count: int
+    file_size: int
+
+# Response Models
+class PaginatedResponse(BaseModel, Generic[TypeVar('T')]):
+    items: List[TypeVar('T')]
+    total_count: int
+    page: int
+    page_size: int
+    has_next: bool
+    has_previous: bool
+
+class OperationResponse(BaseModel):
+    success: bool
+    message: str
+    details: Optional[Dict[str, Any]] = None
+
+# --- Exceptions ---
+class ResourceNotFoundError(HTTPException):
+    def __init__(self, resource_type: str, resource_id: str, environment_id: Optional[str] = None):
+        if environment_id:
+            detail = f"{resource_type} '{resource_id}' not found in environment '{environment_id}'"
+        else:
+            detail = f"{resource_type} '{resource_id}' not found"
+        super().__init__(status_code=status.HTTP_404_NOT_FOUND, detail=detail)
+
+class ResourceConflictError(HTTPException):
+    def __init__(self, resource_type: str, resource_id: str, environment_id: Optional[str] = None):
+        if environment_id:
+            detail = f"{resource_type} '{resource_id}' already exists in environment '{environment_id}'"
+        else:
+            detail = f"{resource_type} '{resource_id}' already exists"
+        super().__init__(status_code=status.HTTP_409_CONFLICT, detail=detail)
+
+class ValidationError(HTTPException):
+    def __init__(self, message: str):
+        super().__init__(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=message)
+
+class DependencyError(HTTPException):
+    def __init__(self, message: str):
+        super().__init__(status_code=status.HTTP_409_CONFLICT, detail=message)
+
+
+class DatabaseClients:
+    """Centralized database clients manager."""
+    
+    def __init__(self):
+        self.mongo_client: Optional[AsyncIOMotorClient] = None
+        self.mongo_db: Optional[AsyncIOMotorDatabase] = None
+        self.neo4j_driver: Optional[AsyncGraphDatabase] = None
+        self.kafka_producer: Optional[AIOKafkaProducer] = None
+        self.influxdb_client: Optional[InfluxDBClient] = None
+        
+    async def initialize(self):
+        """Initialize all database connections."""
+        try:
+            # MongoDB
+            self.mongo_client = AsyncIOMotorClient(settings.MONGO_URI)
+            self.mongo_db = self.mongo_client[settings.MONGO_DB_NAME]
+            await self.mongo_client.admin.command('ping')
+            logger.info("Connected to MongoDB")
+            
+            # Create indexes
+            await self._create_mongodb_indexes()
+            
+            # Neo4j
+            self.neo4j_driver = AsyncGraphDatabase.driver(
+                settings.NEO4J_URI,
+                auth=(settings.NEO4J_USER, settings.NEO4J_PASSWORD)
+            )
+            await self.neo4j_driver.verify_connectivity()
+            logger.info("Connected to Neo4j")
+            
+            # Create constraints
+            await self._create_neo4j_constraints()
+            
+            # Kafka
+            self.kafka_producer = AIOKafkaProducer(
+                bootstrap_servers=settings.KAFKA_BROKER
+            )
+            await self.kafka_producer.start()
+            logger.info("Connected to Kafka")
+            
+            # InfluxDB
+            self.influxdb_client = InfluxDBClient(
+                url=settings.INFLUXDB_URL,
+                token=settings.INFLUXDB_TOKEN,
+                org=settings.INFLUXDB_ORG
+            )
+            self.influxdb_client.ping()
+            logger.info("Connected to InfluxDB")
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize database clients: {e}")
+            await self.cleanup()
+            raise
+    
+    async def cleanup(self):
+        """Close all database connections."""
+        if self.mongo_client:
+            self.mongo_client.close()
+        if self.neo4j_driver:
+            await self.neo4j_driver.close()
+        if self.kafka_producer:
+            await self.kafka_producer.stop()
+        if self.influxdb_client:
+            self.influxdb_client.close()
+    
+    async def _create_mongodb_indexes(self):
+        """Create MongoDB indexes."""
+        indexes = [
+            # Environments
+            (self.mongo_db["environments"], [IndexModel("environment_id", unique=True)]),
+            # Models
+            (self.mongo_db["models"], [IndexModel([("environment_id", 1), ("model_id", 1)], unique=True)]),
+            # Twins
+            (self.mongo_db["twins"], [
+                IndexModel([("environment_id", 1), ("twin_id", 1)], unique=True),
+                IndexModel([("environment_id", 1), ("model_id", 1)])
+            ]),
+            # Devices
+            (self.mongo_db["devices"], [IndexModel([("environment_id", 1), ("device_id", 1)], unique=True)]),
+            # Workflows
+            (self.mongo_db["workflows"], [IndexModel([("environment_id", 1), ("workflow_id", 1)], unique=True)]),
+            # Relationships
+            (self.mongo_db["relationships"], [
+                IndexModel([
+                    ("environment_id", 1),
+                    ("source_twin_id", 1),
+                    ("target_twin_id", 1),
+                    ("relationship_name", 1)
+                ], unique=True)
+            ])
+        ]
+        
+        for collection, index_models in indexes:
+            await collection.create_indexes(index_models)
+        logger.info("MongoDB indexes created")
+    
+    async def _create_neo4j_constraints(self):
+        """Create Neo4j constraints."""
+        constraints = [
+            "CREATE CONSTRAINT twin_id_unique IF NOT EXISTS FOR (t:Twin) REQUIRE t.twin_id IS UNIQUE",
+            "CREATE INDEX twin_environment_id IF NOT EXISTS FOR (t:Twin) ON (t.environment_id)",
+            "CREATE INDEX twin_model_id IF NOT EXISTS FOR (t:Twin) ON (t.model_id)"
+        ]
+        
+        async with self.neo4j_driver.session() as session:
+            for constraint in constraints:
+                try:
+                    await session.run(constraint)
+                except Neo4jError as e:
+                    if "already exists" not in str(e):
+                        raise
+
+# --- Base Service Class ---
+class BaseService(ABC):
+    """Base service class with common functionality."""
+    
+    def __init__(self, db: AsyncIOMotorDatabase):
+        self.db = db
+        self._cache = {}  # Simple cache for existence checks
+        
+    @property
+    @abstractmethod
+    def collection_name(self) -> str:
+        """Return the MongoDB collection name."""
+        pass
+    
+    @property
+    def collection(self):
+        """Return the MongoDB collection."""
+        return self.db[self.collection_name]
+    
+    async def check_environment_exists(self, environment_id: str) -> bool:
+        """Check if environment exists (with caching)."""
+        cache_key = f"env:{environment_id}"
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+            
+        exists = await self.db["environments"].count_documents(
+            {"environment_id": environment_id}, limit=1
+        ) > 0
+        self._cache[cache_key] = exists
+        return exists
+    
+    def clear_cache(self, pattern: Optional[str] = None):
+        """Clear cache entries."""
+        if pattern:
+            self._cache = {k: v for k, v in self._cache.items() if not k.startswith(pattern)}
+        else:
+            self._cache.clear()
 
 # --- Service Classes ---
-
-# TwinService: 完整的 TwinService 实现
-class TwinService:
-    def __init__(self, db: AsyncIOMotorClient, neo4j_driver: AsyncGraphDatabase):
-        self.twins_collection = db["digital_twin_db"]["twins"]
-        self.models_collection = db["digital_twin_db"]["models"] # 用于 validate_twin_properties_against_model
-        self.neo4j_driver = neo4j_driver
-
-    async def _validate_twin_properties_against_model(self, environment_id: str, model_id: str, properties: Dict[str, Any]):
-        """Helper to validate twin properties against its model's definition."""
-        model_doc = await self.models_collection.find_one({"environment_id": environment_id, "model_id": model_id})
-        if not model_doc:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Model '{model_id}' not found in environment '{environment_id}'.")
-
-        model_schema = ModelSchema(**remove_mongo_id(model_doc))
-
-        for prop_name, prop_value in properties.items():
-            if prop_name not in model_schema.properties:
-                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Property '{prop_name}' not defined in model '{model_id}'.")
-
-            prop_def = model_schema.properties[prop_name]
-            expected_type = prop_def.type.value # e.g., "string", "number", "boolean"
-
-            # Type validation (basic)
-            if expected_type == "string" and not isinstance(prop_value, str):
-                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Property '{prop_name}' must be a string.")
-            elif expected_type == "number" and not isinstance(prop_value, (int, float)):
-                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Property '{prop_name}' must be a number.")
-            elif expected_type == "boolean" and not isinstance(prop_value, bool):
-                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Property '{prop_name}' must be a boolean.")
-
-    async def create_twin(self, environment_id: str, twin_data: TwinCreateRequest) -> TwinSchema:
-        logger.info(f"Attempting to create twin '{twin_data.twin_id}' in environment '{environment_id}'.")
-
-        # 1. Check for existing twin with same ID in this environment
-        existing_twin = await self.twins_collection.find_one({"environment_id": environment_id, "twin_id": twin_data.twin_id})
-        if existing_twin:
-            logger.warning(f"Twin '{twin_data.twin_id}' already exists in environment '{environment_id}'.")
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Twin '{twin_data.twin_id}' already exists in this environment.")
-
-        # 2. Validate properties against model schema
-        await self._validate_twin_properties_against_model(environment_id, twin_data.model_id, twin_data.properties)
-
-        new_twin_doc = TwinSchema(
-            twin_id=twin_data.twin_id,
-            environment_id=environment_id,
-            model_id=twin_data.model_id,
-            properties=twin_data.properties
+class EnvironmentService(BaseService):
+    """Service for managing environments."""
+    
+    collection_name = "environments"
+    
+    def __init__(self, db: AsyncIOMotorDatabase, twin_service: 'TwinService'):
+        super().__init__(db)
+        self.twin_service = twin_service
+        
+    async def create(self, data: EnvironmentCreate) -> Environment:
+        """Create a new environment."""
+        # Check if already exists
+        if await self.collection.count_documents({"environment_id": data.environment_id}, limit=1) > 0:
+            raise ResourceConflictError("Environment", data.environment_id)
+        
+        environment = Environment(**data.model_dump())
+        await self.collection.insert_one(environment.model_dump_mongo())
+        
+        # Update cache
+        self._cache[f"env:{data.environment_id}"] = True
+        
+        logger.info(f"Created environment: {data.environment_id}")
+        return environment
+    
+    async def get(self, environment_id: str) -> Environment:
+        """Get an environment by ID."""
+        doc = await self.collection.find_one({"environment_id": environment_id})
+        if not doc:
+            raise ResourceNotFoundError("Environment", environment_id)
+        return Environment(**remove_mongo_id(doc))
+    
+    async def list(self, skip: int = 0, limit: int = 100) -> PaginatedResponse[Environment]:
+        """List environments with pagination."""
+        total_count = await self.collection.count_documents({})
+        
+        cursor = self.collection.find({}).sort("created_at", DESCENDING).skip(skip).limit(limit)
+        items = [Environment(**remove_mongo_id(doc)) async for doc in cursor]
+        
+        return PaginatedResponse(
+            items=items,
+            total_count=total_count,
+            page=skip // limit + 1,
+            page_size=limit,
+            has_next=skip + limit < total_count,
+            has_previous=skip > 0
+        )
+    
+    async def update(self, environment_id: str, data: EnvironmentUpdate) -> Environment:
+        """Update an environment."""
+        update_data = data.model_dump(exclude_unset=True)
+        if not update_data:
+            raise ValidationError("No fields to update")
+        
+        update_data["updated_at"] = datetime.utcnow()
+        
+        result = await self.collection.update_one(
+            {"environment_id": environment_id},
+            {"$set": update_data}
+        )
+        
+        if result.matched_count == 0:
+            raise ResourceNotFoundError("Environment", environment_id)
+        
+        return await self.get(environment_id)
+    
+    async def delete(self, environment_id: str) -> OperationResponse:
+        """Delete an environment and all its resources."""
+        # Check if exists
+        if not await self.check_environment_exists(environment_id):
+            raise ResourceNotFoundError("Environment", environment_id)
+        
+        # Delete all twins (this will cascade to Neo4j)
+        twin_ids = await self.db["twins"].distinct("twin_id", {"environment_id": environment_id})
+        for twin_id in twin_ids:
+            await self.twin_service.delete(environment_id, twin_id)
+        
+        # Delete other resources
+        collections_to_clean = ["devices", "models", "workflows", "relationships"]
+        for collection_name in collections_to_clean:
+            result = await self.db[collection_name].delete_many({"environment_id": environment_id})
+            if result.deleted_count > 0:
+                logger.info(f"Deleted {result.deleted_count} {collection_name} from environment {environment_id}")
+        
+        # Delete environment
+        await self.collection.delete_one({"environment_id": environment_id})
+        
+        # Clear cache
+        self.clear_cache(f"env:{environment_id}")
+        
+        logger.info(f"Deleted environment: {environment_id}")
+        return OperationResponse(
+            success=True,
+            message=f"Environment '{environment_id}' and all its resources deleted successfully"
         )
 
-        # 3. Create twin in MongoDB
-        try:
-            insert_result = await self.twins_collection.insert_one(new_twin_doc.model_dump_mongo(by_alias=True))
-            logger.info(f"Twin '{new_twin_doc.twin_id}' successfully inserted into MongoDB with ID: {insert_result.inserted_id}")
-        except Exception as e:
-            logger.critical(f"Failed to insert twin '{new_twin_doc.twin_id}' into MongoDB: {e}", exc_info=True)
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to create twin in document database.")
+class DeviceService(BaseService):
+    """Service for managing devices."""
+    
+    collection_name = "devices"
+    
+    async def create(self, environment_id: str, data: DeviceCreate) -> Device:
+        """Create a new device."""
+        # Check environment exists
+        if not await self.check_environment_exists(environment_id):
+            raise ResourceNotFoundError("Environment", environment_id)
+        
+        # Check if device already exists
+        if await self.collection.count_documents({
+            "environment_id": environment_id,
+            "device_id": data.device_id
+        }, limit=1) > 0:
+            raise ResourceConflictError("Device", data.device_id, environment_id)
+        
+        device = Device(environment_id=environment_id, **data.model_dump())
+        await self.collection.insert_one(device.model_dump_mongo())
+        
+        logger.info(f"Created device: {data.device_id} in environment: {environment_id}")
+        return device
+    
+    async def get(self, environment_id: str, device_id: str) -> Device:
+        """Get a device by ID."""
+        doc = await self.collection.find_one({
+            "environment_id": environment_id,
+            "device_id": device_id
+        })
+        if not doc:
+            raise ResourceNotFoundError("Device", device_id, environment_id)
+        return Device(**remove_mongo_id(doc))
+    
+    async def list(self, environment_id: str, skip: int = 0, limit: int = 100) -> PaginatedResponse[Device]:
+        """List devices in an environment."""
+        query = {"environment_id": environment_id}
+        total_count = await self.collection.count_documents(query)
+        
+        cursor = self.collection.find(query).sort("created_at", DESCENDING).skip(skip).limit(limit)
+        items = [Device(**remove_mongo_id(doc)) async for doc in cursor]
+        
+        return PaginatedResponse(
+            items=items,
+            total_count=total_count,
+            page=skip // limit + 1,
+            page_size=limit,
+            has_next=skip + limit < total_count,
+            has_previous=skip > 0
+        )
+    # TODO: 待修改，是否需要增加schema
+    async def update(self, environment_id: str, device_id: str, data: DeviceUpdate) -> Device:
+        """Update a device."""
+        update_data = data.model_dump(exclude_unset=True)
+        if not update_data:
+            raise ValidationError("No fields to update")
+        
+        update_data["updated_at"] = datetime.utcnow()
+        
+        result = await self.collection.update_one(
+            {"environment_id": environment_id, "device_id": device_id},
+            {"$set": update_data}
+        )
+        
+        if result.matched_count == 0:
+            raise ResourceNotFoundError("Device", device_id, environment_id)
+        
+        return await self.get(environment_id, device_id)
+    
+    async def delete(self, environment_id: str, device_id: str) -> OperationResponse:
+        """Delete a device."""
+        result = await self.collection.delete_one({
+            "environment_id": environment_id,
+            "device_id": device_id
+        })
+        
+        if result.deleted_count == 0:
+            raise ResourceNotFoundError("Device", device_id, environment_id)
+        
+        logger.info(f"Deleted device: {device_id} from environment: {environment_id}")
+        return OperationResponse(
+            success=True,
+            message=f"Device '{device_id}' deleted successfully"
+        )
 
-        # 4. Create twin node in Neo4j
+
+class ModelService(BaseService):
+    """Service for managing models."""
+    
+    collection_name = "models"
+    
+    async def create(self, environment_id: str, data: ModelCreate) -> Model:
+        """Create a new model."""
+        # Check environment exists
+        if not await self.check_environment_exists(environment_id):
+            raise ResourceNotFoundError("Environment", environment_id)
+        
+        # Check if model already exists
+        if await self.collection.count_documents({
+            "environment_id": environment_id,
+            "model_id": data.model_id
+        }, limit=1) > 0:
+            raise ResourceConflictError("Model", data.model_id, environment_id)
+        
+        model = Model(environment_id=environment_id, **data.model_dump())
+        await self.collection.insert_one(model.model_dump_mongo())
+        
+        logger.info(f"Created model: {data.model_id} in environment: {environment_id}")
+        return model
+    
+    async def get(self, environment_id: str, model_id: str) -> Model:
+        """Get a model by ID."""
+        doc = await self.collection.find_one({
+            "environment_id": environment_id,
+            "model_id": model_id
+        })
+        if not doc:
+            raise ResourceNotFoundError("Model", model_id, environment_id)
+        return Model(**remove_mongo_id(doc))
+    
+    async def list(self, environment_id: str, skip: int = 0, limit: int = 100) -> PaginatedResponse[Model]:
+        """List models in an environment."""
+        query = {"environment_id": environment_id}
+        total_count = await self.collection.count_documents(query)
+        
+        cursor = self.collection.find(query).sort("created_at", DESCENDING).skip(skip).limit(limit)
+        items = [Model(**remove_mongo_id(doc)) async for doc in cursor]
+        
+        return PaginatedResponse(
+            items=items,
+            total_count=total_count,
+            page=skip // limit + 1,
+            page_size=limit,
+            has_next=skip + limit < total_count,
+            has_previous=skip > 0
+        )
+    
+    async def update(self, environment_id: str, model_id: str, data: ModelUpdate) -> Model:
+        """Update a model."""
+        update_data = data.model_dump(exclude_unset=True)
+        if not update_data:
+            raise ValidationError("No fields to update")
+        
+        update_data["updated_at"] = datetime.utcnow()
+        
+        result = await self.collection.update_one(
+            {"environment_id": environment_id, "model_id": model_id},
+            {"$set": update_data}
+        )
+        
+        if result.matched_count == 0:
+            raise ResourceNotFoundError("Model", model_id, environment_id)
+        
+        return await self.get(environment_id, model_id)
+    
+    async def delete(self, environment_id: str, model_id: str) -> OperationResponse:
+        """Delete a model."""
+        # Check if model has twins
+        twin_count = await self.db["twins"].count_documents({
+            "environment_id": environment_id,
+            "model_id": model_id
+        }, limit=1)
+        
+        if twin_count > 0:
+            raise DependencyError(
+                f"Cannot delete model '{model_id}'. "
+                "There are digital twins using this model. Please delete associated twins first."
+            )
+        
+        result = await self.collection.delete_one({
+            "environment_id": environment_id,
+            "model_id": model_id
+        })
+        
+        if result.deleted_count == 0:
+            raise ResourceNotFoundError("Model", model_id, environment_id)
+        
+        logger.info(f"Deleted model: {model_id} from environment: {environment_id}")
+        return OperationResponse(
+            success=True,
+            message=f"Model '{model_id}' deleted successfully"
+        )
+
+class TwinService(BaseService):
+    """Service for managing digital twins."""
+    
+    collection_name = "twins"
+    
+    def __init__(self, db: AsyncIOMotorDatabase, neo4j_driver: AsyncGraphDatabase):
+        super().__init__(db)
+        self.neo4j_driver = neo4j_driver
+
+    # TODO: 是否需要验证
+    async def validate_properties(self, environment_id: str, model_id: str, properties: Dict[str, Any]):
+        """Validate twin properties against model definition."""
+        model_doc = await self.db["models"].find_one({
+            "environment_id": environment_id,
+            "model_id": model_id
+        })
+        
+        if not model_doc:
+            raise ResourceNotFoundError("Model", model_id, environment_id)
+        
+        model = Model(**remove_mongo_id(model_doc))
+        
+        # Check required properties
+        for prop_name, prop_def in model.properties.items():
+            if prop_def.is_required and prop_name not in properties:
+                # Check if there's a default value
+                if prop_def.default_value is not None:
+                    properties[prop_name] = prop_def.default_value
+                else:
+                    raise ValidationError(f"Required property '{prop_name}' is missing")
+        
+        # Validate property types
+        for prop_name, prop_value in properties.items():
+            if prop_name not in model.properties:
+                raise ValidationError(f"Property '{prop_name}' not defined in model '{model_id}'")
+            
+            prop_def = model.properties[prop_name]
+            
+            # Type validation
+            if prop_def.type == PropertyType.STRING and not isinstance(prop_value, str):
+                raise ValidationError(f"Property '{prop_name}' must be a string")
+            elif prop_def.type == PropertyType.NUMBER and not isinstance(prop_value, (int, float)):
+                raise ValidationError(f"Property '{prop_name}' must be a number")
+            elif prop_def.type == PropertyType.BOOLEAN and not isinstance(prop_value, bool):
+                raise ValidationError(f"Property '{prop_name}' must be a boolean")
+            
+            # Constraint validation
+            if prop_def.constraints:
+                if "min" in prop_def.constraints and prop_value < prop_def.constraints["min"]:
+                    raise ValidationError(f"Property '{prop_name}' must be >= {prop_def.constraints['min']}")
+                if "max" in prop_def.constraints and prop_value > prop_def.constraints["max"]:
+                    raise ValidationError(f"Property '{prop_name}' must be <= {prop_def.constraints['max']}")
+                if "pattern" in prop_def.constraints and isinstance(prop_value, str):
+                    if not re.match(prop_def.constraints["pattern"], prop_value):
+                        raise ValidationError(f"Property '{prop_name}' does not match required pattern")
+    
+    async def create(self, environment_id: str, data: TwinCreate) -> Twin:
+        """Create a new digital twin."""
+        # Check environment exists
+        if not await self.check_environment_exists(environment_id):
+            raise ResourceNotFoundError("Environment", environment_id)
+        
+        # Check if twin already exists
+        if await self.collection.count_documents({
+            "environment_id": environment_id,
+            "twin_id": data.twin_id
+        }, limit=1) > 0:
+            raise ResourceConflictError("Twin", data.twin_id, environment_id)
+        
+        # Validate properties against model
+        await self.validate_properties(environment_id, data.model_id, data.properties)
+        
+        twin = Twin(environment_id=environment_id, **data.model_dump())
+        
+        # Create in MongoDB
+        await self.collection.insert_one(twin.model_dump_mongo())
+        
+        # Create in Neo4j
         try:
             async with self.neo4j_driver.session() as session:
-                query = """
-                MERGE (t:Twin {twin_id: $twin_id, environment_id: $environment_id})
-                SET t.model_id = $model_id,
-                    t.properties = $properties,
-                    t.created_at = $created_at,
-                    t.updated_at = $updated_at
-                """
-                await session.run(query,
-                                twin_id=new_twin_doc.twin_id,
-                                environment_id=new_twin_doc.environment_id,
-                                model_id=new_twin_doc.model_id,
-                                properties=json.dumps(new_twin_doc.properties), # Store properties as JSON string
-                                created_at=new_twin_doc.created_at.isoformat(),
-                                updated_at=new_twin_doc.updated_at.isoformat())
-                logger.info(f"Twin '{new_twin_doc.twin_id}' successfully created in Neo4j.")
+                await session.run(
+                    """
+                    CREATE (t:Twin {
+                        twin_id: $twin_id,
+                        environment_id: $environment_id,
+                        model_id: $model_id
+                    })
+                    """,
+                    twin_id=twin.twin_id,
+                    environment_id=twin.environment_id,
+                    model_id=twin.model_id)
         except Exception as e:
-            logger.critical(f"Failed to create twin '{new_twin_doc.twin_id}' in Neo4j: {e}. Data inconsistency: Twin created in MongoDB but not Neo4j.", exc_info=True)
-            # Rollback MongoDB insertion if Neo4j fails
-            await self.twins_collection.delete_one({"_id": insert_result.inserted_id})
-            logger.warning(f"Rolled back MongoDB twin creation for '{new_twin_doc.twin_id}' due to Neo4j failure.")
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to create twin in graph database. Data rolled back in document database.")
-
-        return new_twin_doc
-
-    async def get_twin(self, environment_id: str, twin_id: str) -> TwinSchema:
-        """Retrieves a single twin."""
-        twin_doc = await self.twins_collection.find_one({"environment_id": environment_id, "twin_id": twin_id})
-        if not twin_doc:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Twin '{twin_id}' not found in this environment.")
-        return TwinSchema(**remove_mongo_id(twin_doc))
-
-    async def list_twins(self, environment_id: str, model_id: Optional[str] = None, skip: int = 0, limit: int = 100) -> List[TwinSchema]:
-        """Lists all twins for a given environment, with optional model filtering."""
+            # Rollback MongoDB operation
+            await self.collection.delete_one({"twin_id": data.twin_id, "environment_id": environment_id})
+            logger.error(f"Failed to create twin in Neo4j: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to create twin in graph database"
+            )
+        
+        logger.info(f"Created twin: {data.twin_id} in environment: {environment_id}")
+        return twin
+    
+    async def get(self, environment_id: str, twin_id: str) -> Twin:
+        """Get a twin by ID."""
+        doc = await self.collection.find_one({
+            "environment_id": environment_id,
+            "twin_id": twin_id
+        })
+        if not doc:
+            raise ResourceNotFoundError("Twin", twin_id, environment_id)
+        return Twin(**remove_mongo_id(doc))
+    
+    async def list(self, environment_id: str, model_id: Optional[str] = None, 
+                   skip: int = 0, limit: int = 100) -> PaginatedResponse[Twin]:
+        """List twins in an environment."""
         query = {"environment_id": environment_id}
         if model_id:
             query["model_id"] = model_id
-        cursor = self.twins_collection.find(query).sort("created_at", DESCENDING).skip(skip).limit(limit)
-        twins = []
-        async for twin_doc in cursor:
-            twins.append(TwinSchema(**remove_mongo_id(twin_doc)))
-        return twins
-
-    async def update_twin(self, environment_id: str, twin_id: str, update_data: TwinUpdateRequest) -> TwinSchema:
-        logger.info(f"Attempting to update twin '{twin_id}' in environment '{environment_id}'.")
-
-        existing_twin_doc = await self.twins_collection.find_one({"environment_id": environment_id, "twin_id": twin_id})
-        if not existing_twin_doc:
-            logger.warning(f"Twin '{twin_id}' not found for update in environment '{environment_id}'.")
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Twin '{twin_id}' not found in this environment.")
-
-        # Prepare update data for MongoDB
-        update_mongo_data = update_data.model_dump(exclude_unset=True)
-        if "properties" in update_mongo_data:
-            # Validate updated properties against model schema
-            await self._validate_twin_properties_against_model(environment_id, existing_twin_doc["model_id"], update_mongo_data["properties"])
-            # Merge properties if needed, or replace based on desired behavior
-            existing_properties = existing_twin_doc.get("properties", {})
-            existing_properties.update(update_mongo_data["properties"])
-            update_mongo_data["properties"] = existing_properties
-
-        update_mongo_data["updated_at"] = datetime.utcnow() # Always update timestamp
-
-        # Update in MongoDB
-        try:
-            update_result = await self.twins_collection.update_one(
-                {"environment_id": environment_id, "twin_id": twin_id},
-                {"$set": update_mongo_data}
-            )
-            if update_result.matched_count == 0:
-                logger.warning(f"Twin '{twin_id}' not matched for update in MongoDB, despite initial find.")
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Twin '{twin_id}' not found for update.")
-            logger.info(f"Twin '{twin_id}' successfully updated in MongoDB.")
-        except Exception as e:
-            logger.critical(f"Failed to update twin '{twin_id}' in MongoDB: {e}", exc_info=True)
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to update twin in document database.")
-
-        # Update twin node in Neo4j
-        try:
-            async with self.neo4j_driver.session() as session:
-                query = """
-                MATCH (t:Twin {twin_id: $twin_id, environment_id: $environment_id})
-                SET t.properties = $properties_json,
-                    t.updated_at = $updated_at
-                """
-                # Neo4j stores properties as map, but nested dicts might be an issue. Storing as JSON string is safer.
-                neo4j_properties = existing_twin_doc.get("properties", {})
-                if "properties" in update_data.model_dump(exclude_unset=True):
-                    neo4j_properties.update(update_data.properties)
-
-
-                await session.run(query,
-                                twin_id=twin_id,
-                                environment_id=environment_id,
-                                properties_json=json.dumps(neo4j_properties),
-                                updated_at=update_mongo_data["updated_at"].isoformat())
-                logger.info(f"Twin '{twin_id}' successfully updated in Neo4j.")
-        except Exception as e:
-            logger.critical(f"Failed to update twin '{twin_id}' in Neo4j: {e}. Data inconsistency: Twin updated in MongoDB but not Neo4j.", exc_info=True)
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to update twin in graph database. Data is inconsistent.")
-
-        # Fetch and return the updated twin
-        updated_twin_doc = await self.twins_collection.find_one({"environment_id": environment_id, "twin_id": twin_id})
-        return TwinSchema(**remove_mongo_id(updated_twin_doc))
-
-    async def delete_twin(self, environment_id: str, twin_id: str) -> Dict[str, str]:
-        """
-        Deletes a twin and its relationships from Neo4j and MongoDB.
-        """
-        logger.info(f"Attempting to delete twin '{twin_id}' in environment '{environment_id}'.")
-
-        # 1. Validate twin exists in MongoDB
-        twin_doc = await self.twins_collection.find_one({"environment_id": environment_id, "twin_id": twin_id})
-        if not twin_doc:
-            logger.warning(f"Twin '{twin_id}' not found in MongoDB for environment '{environment_id}'.")
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Twin '{twin_id}' not found in this environment.")
-
-        # 2. Delete twin node and its relationships from Neo4j
+        
+        total_count = await self.collection.count_documents(query)
+        
+        cursor = self.collection.find(query).sort("created_at", DESCENDING).skip(skip).limit(limit)
+        items = [Twin(**remove_mongo_id(doc)) async for doc in cursor]
+        
+        return PaginatedResponse(
+            items=items,
+            total_count=total_count,
+            page=skip // limit + 1,
+            page_size=limit,
+            has_next=skip + limit < total_count,
+            has_previous=skip > 0
+        )
+    
+    # TODO: twin的update到底可以update什么
+    async def update(self, environment_id: str, twin_id: str, data: TwinUpdate) -> Twin:
+        """Update a twin."""
+        # Get existing twin
+        existing = await self.get(environment_id, twin_id)
+        
+        update_data = data.model_dump(exclude_unset=True)
+        if not update_data:
+            raise ValidationError("No fields to update")
+        
+        # If updating properties, validate them
+        if "properties" in update_data:
+            merged_properties = {**existing.properties, **update_data["properties"]}
+            await self.validate_properties(environment_id, existing.model_id, merged_properties)
+            update_data["properties"] = merged_properties
+        
+        update_data["updated_at"] = datetime.utcnow()
+        
+        # Update MongoDB
+        result = await self.collection.update_one(
+            {"environment_id": environment_id, "twin_id": twin_id},
+            {"$set": update_data}
+        )
+        
+        if result.matched_count == 0:
+            raise ResourceNotFoundError("Twin", twin_id, environment_id)
+        
+        return await self.get(environment_id, twin_id)
+    
+    async def delete(self, environment_id: str, twin_id: str) -> OperationResponse:
+        """Delete a twin and its relationships."""
+        # Check if exists
+        if not await self.collection.count_documents({
+            "environment_id": environment_id,
+            "twin_id": twin_id
+        }, limit=1) > 0:
+            raise ResourceNotFoundError("Twin", twin_id, environment_id)
+        
+        # Delete from Neo4j (including relationships)
         try:
             async with self.neo4j_driver.session() as session:
-                # DETACH DELETE ensures all relationships connected to the twin node are also removed
                 result = await session.run(
                     """
                     MATCH (t:Twin {twin_id: $twin_id, environment_id: $environment_id})
                     DETACH DELETE t
                     RETURN count(t) AS deleted_count
                     """,
-                    twin_id=twin_id, environment_id=environment_id
+                    twin_id=twin_id,
+                    environment_id=environment_id
                 )
                 record = await result.single()
-                neo4j_deleted_count = record["deleted_count"] if record else 0
-
-                if neo4j_deleted_count > 0:
-                    logger.info(f"Twin '{twin_id}' and its relationships successfully deleted from Neo4j.")
-                else:
-                    logger.warning(f"Twin '{twin_id}' not found in Neo4j for environment '{environment_id}'. Possible prior inconsistency.")
-
+                if record and record["deleted_count"] == 0:
+                    logger.warning(f"Twin {twin_id} not found in Neo4j")
         except Exception as e:
-            logger.error(f"Failed to delete twin '{twin_id}' from Neo4j: {e}", exc_info=True)
+            logger.error(f"Failed to delete twin from Neo4j: {e}")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Failed to delete twin '{twin_id}' from graph database: {e}. Data might be inconsistent. Please contact support."
+                detail="Failed to delete twin from graph database"
             )
-
-        # 3. Delete twin document from MongoDB
-        try:
-            mongo_delete_result = await self.twins_collection.delete_one({"environment_id": environment_id, "twin_id": twin_id})
-
-            if mongo_delete_result.deleted_count == 0:
-                logger.warning(f"Twin '{twin_id}' not found in MongoDB during deletion, after Neo4j operation.")
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Twin '{twin_id}' not found in MongoDB during deletion.")
-
-            logger.info(f"Twin '{twin_id}' in environment '{environment_id}' successfully deleted from MongoDB.")
-
-        except Exception as e:
-            logger.critical(f"Failed to delete twin '{twin_id}' from MongoDB: {e}. Data inconsistency: Twin might be deleted from Neo4j but not MongoDB.", exc_info=True)
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Failed to delete twin '{twin_id}' from document database: {e}. Data is now inconsistent. Please contact support."
-            )
-
-        logger.info(f"Twin '{twin_id}' in environment '{environment_id}' fully deleted.")
-        return {"detail": f"Twin '{twin_id}' deleted successfully."}
-
-
-class EnvironmentService:
-    def __init__(
-        self,
-        db: AsyncIOMotorClient,
-        twin_service: 'TwinService',      # <-- 修正：使用字符串引用，并在 FastAPI 依赖注入时注入实际的 TwinService
-        model_service: 'ModelService',    # <-- 修正：使用字符串引用
-        device_service: 'DeviceService'   # <-- 修正：使用字符串引用
-    ):
-        self.env_collection = db["digital_twin_db"]["environments"]
-        # 需要访问子集合来获取要删除的ID列表
-        self.twins_collection = db["digital_twin_db"]["twins"]
-        self.models_collection = db["digital_twin_db"]["models"]
-        self.devices_collection = db["digital_twin_db"]["devices"]
-        self.twin_service = twin_service
-        self.model_service = model_service
-        self.device_service = device_service
-
-    async def create_environment(self, env_data: EnvironmentCreateRequest) -> EnvironmentModel:
-        """Creates a new environment."""
-        logger.info(f"Attempting to create environment '{env_data.environment_id}'.")
-        existing_env = await self.env_collection.find_one({"environment_id": env_data.environment_id})
-        if existing_env:
-            logger.warning(f"Environment '{env_data.environment_id}' already exists.")
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Environment '{env_data.environment_id}' already exists.")
-
-        new_env = EnvironmentModel(
-            environment_id=env_data.environment_id,
-            display_name=env_data.display_name,
-            description=env_data.description
-        )
-        try:
-            await self.env_collection.insert_one(new_env.model_dump_mongo(by_alias=True))
-            logger.info(f"Environment '{new_env.environment_id}' created successfully in MongoDB.")
-            # Note: As per our discussion, Environment nodes are NOT stored in Neo4j.
-        except Exception as e:
-            logger.critical(f"Failed to create environment '{new_env.environment_id}' in MongoDB: {e}", exc_info=True)
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to create environment.")
-        return new_env
-
-    async def list_environments(self, skip: int = 0, limit: int = 100) -> List[EnvironmentModel]:
-        """Lists all environments."""
-        cursor = self.env_collection.find({}).sort("created_at", DESCENDING).skip(skip).limit(limit) # <-- 使用 DESCENDING
-        environments = []
-        async for env_doc in cursor:
-            environments.append(EnvironmentModel(**remove_mongo_id(env_doc)))
-        return environments
-
-    async def get_environment(self, environment_id: str) -> EnvironmentModel:
-        """Retrieves a single environment."""
-        env_doc = await self.env_collection.find_one({"environment_id": environment_id})
-        if not env_doc:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Environment '{environment_id}' not found.")
-        return EnvironmentModel(**remove_mongo_id(env_doc))
-
-    async def update_environment(self, environment_id: str, update_data: EnvironmentUpdateRequest) -> EnvironmentModel:
-        """Updates an existing environment."""
-        logger.info(f"Attempting to update environment '{environment_id}'.")
-        update_doc = update_data.model_dump(exclude_unset=True)
-        if not update_doc:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No fields to update.")
-
-        update_doc["updated_at"] = datetime.utcnow()
-        result = await self.env_collection.update_one(
-            {"environment_id": environment_id},
-            {"$set": update_doc}
-        )
-        if result.matched_count == 0:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Environment '{environment_id}' not found.")
-        logger.info(f"Environment '{environment_id}' updated successfully.")
-
-        updated_env = await self.env_collection.find_one({"environment_id": environment_id})
-        return EnvironmentModel(**remove_mongo_id(updated_env))
-
-    async def delete_environment(self, environment_id: str) -> Dict[str, str]:
-        """
-        删除一个环境及其所有关联的数字孪生、模型和设备。
-        此操作将级联删除 MongoDB 中的所有相关数据，并清理 Neo4j 中的孪生节点及关系。
-        Environment 节点本身不在 Neo4j 中，所以不删除 Neo4j 中的环境节点。
-
-        Args:
-            environment_id: 要删除的环境的 ID。
-
-        Returns:
-            Dict[str, str]: 包含删除结果的消息。
-
-        Raises:
-            HTTPException: 如果环境未找到，或删除过程中发生错误，导致数据不一致。
-        """
-        logger.info(f"Attempting to delete environment '{environment_id}' and all its contents.")
-
-        # 1. 在 MongoDB 中验证环境是否存在
-        env_doc = await self.env_collection.find_one({"environment_id": environment_id})
-        if not env_doc:
-            logger.warning(f"Environment '{environment_id}' not found in MongoDB for deletion.")
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Environment '{environment_id}' not found.")
-
-        # --- 级联删除子实体 (先收集 ID，再逐一删除) ---
-
-        # 2. 删除所有属于此环境的数字孪生
-        twins_to_delete = []
-        async for twin_doc in self.twins_collection.find({"environment_id": environment_id}):
-            twins_to_delete.append(twin_doc["twin_id"])
-
-        for twin_id in twins_to_delete:
-            try:
-                # 调用实际的 TwinService 的 delete_twin 方法
-                await self.twin_service.delete_twin(environment_id, twin_id)
-                logger.info(f"Successfully deleted twin '{twin_id}' as part of environment '{environment_id}' deletion.")
-            except HTTPException as e:
-                logger.error(f"Failed to delete twin '{twin_id}' during environment '{environment_id}' cleanup: {e.detail}", exc_info=True)
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail=f"Failed to delete twin '{twin_id}' during environment cleanup: {e.detail}. Environment deletion aborted."
-                )
-            except Exception as e:
-                logger.critical(f"Critical error deleting twin '{twin_id}' during environment '{environment_id}' cleanup: {e}", exc_info=True)
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail=f"Critical error during environment cleanup for twin '{twin_id}': {e}. Environment deletion aborted."
-                )
-        if twins_to_delete:
-            logger.info(f"Successfully deleted {len(twins_to_delete)} twins for environment '{environment_id}'.")
-
-
-        # 3. 删除所有属于此环境的设备
-        devices_to_delete = []
-        async for device_doc in self.devices_collection.find({"environment_id": environment_id}):
-            devices_to_delete.append(device_doc["device_id"])
-
-        for device_id in devices_to_delete:
-            try:
-                # 调用实际的 DeviceService 的 delete_device 方法
-                await self.device_service.delete_device(environment_id, device_id)
-                logger.info(f"Successfully deleted device '{device_id}' as part of environment '{environment_id}' deletion.")
-            except HTTPException as e:
-                logger.error(f"Failed to delete device '{device_id}' during environment '{environment_id}' deletion: {e.detail}", exc_info=True)
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail=f"Failed to delete device '{device_id}' during environment cleanup: {e.detail}. Environment deletion aborted."
-                )
-            except Exception as e:
-                logger.critical(f"Critical error deleting device '{device_id}' during environment '{environment_id}' cleanup: {e}", exc_info=True)
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail=f"Critical error during environment cleanup for device '{device_id}': {e}. Environment deletion aborted."
-                )
-        if devices_to_delete:
-            logger.info(f"Successfully deleted {len(devices_to_delete)} devices for environment '{environment_id}'.")
-
-
-        # 4. 删除所有属于此环境的模型
-        models_to_delete = []
-        async for model_doc in self.models_collection.find({"environment_id": environment_id}):
-            models_to_delete.append(model_doc["model_id"])
-
-        for model_id in models_to_delete:
-            try:
-                # 调用实际的 ModelService 的 delete_model 方法
-                await self.model_service.delete_model(environment_id, model_id)
-                logger.info(f"Successfully deleted model '{model_id}' as part of environment '{environment_id}' deletion.")
-            except HTTPException as e:
-                logger.error(f"Failed to delete model '{model_id}' during environment '{environment_id}' deletion: {e.detail}", exc_info=True)
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail=f"Failed to delete model '{model_id}' during environment cleanup: {e.detail}. Environment deletion aborted."
-                )
-            except Exception as e:
-                logger.critical(f"Critical error deleting model '{model_id}' during environment '{environment_id}' cleanup: {e}", exc_info=True)
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail=f"Critical error during environment cleanup for model '{model_id}': {e}. Environment deletion aborted."
-                )
-        if models_to_delete:
-            logger.info(f"Successfully deleted {len(models_to_delete)} models for environment '{environment_id}'.")
-
-
-        # --- 最后删除环境自身 (仅 MongoDB) ---
-
-        # 5. 在 MongoDB 中删除环境自身
-        try:
-            mongo_delete_result = await self.env_collection.delete_one({"environment_id": environment_id})
-            if mongo_delete_result.deleted_count == 0:
-                logger.warning(f"Environment '{environment_id}' not found in MongoDB during final self-deletion step.")
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Environment '{environment_id}' not found during final deletion.")
-            logger.info(f"Environment '{environment_id}' successfully deleted from MongoDB.")
-        except Exception as e:
-            logger.critical(f"Failed to delete environment '{environment_id}' from MongoDB: {e}", exc_info=True)
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Failed to delete environment '{environment_id}' from document database: {e}. Please contact support."
-            )
-
-        # 6. 移除 Neo4j 环境节点删除逻辑 (根据您的指示，Neo4j 中没有 Environment 节点)
-        logger.info(f"Skipping Neo4j deletion for environment '{environment_id}' as no environment node is expected.")
-
-        logger.info(f"Environment '{environment_id}' and all its associated data fully deleted.")
-        return {"detail": f"Environment '{environment_id}' and all its contents deleted successfully."}
-
-
-class DeviceService:
-    def __init__(self, db: AsyncIOMotorClient):
-        self.devices_collection = db["digital_twin_db"]["devices"]
-
-    async def create_device(self, environment_id: str, device_data: DeviceCreateRequest) -> DeviceModel:
-        logger.info(f"Attempting to create device '{device_data.device_id}' in environment '{environment_id}'.")
-        existing_device = await self.devices_collection.find_one({"environment_id": environment_id, "device_id": device_data.device_id})
-        if existing_device:
-            logger.warning(f"Device '{device_data.device_id}' already exists in environment '{environment_id}'.")
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Device '{device_data.device_id}' already exists in this environment.")
-
-        new_device = DeviceModel(
-            device_id=device_data.device_id,
-            environment_id=environment_id,
-            display_name=device_data.display_name,
-            description=device_data.description,
-            properties=device_data.properties
-        )
-        try:
-            await self.devices_collection.insert_one(new_device.model_dump_mongo(by_alias=True))
-            logger.info(f"Device '{new_device.device_id}' created successfully.")
-        except Exception as e:
-            logger.critical(f"Failed to create device '{new_device.device_id}': {e}", exc_info=True)
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to create device.")
-        return new_device
-
-    async def list_devices(self, environment_id: str, skip: int = 0, limit: int = 100) -> List[DeviceModel]:
-        """Lists all devices for a given environment."""
-        query = {"environment_id": environment_id}
-        cursor = self.devices_collection.find(query).sort("created_at", DESCENDING).skip(skip).limit(limit)
-        devices = []
-        async for device_doc in cursor:
-            devices.append(DeviceModel(**remove_mongo_id(device_doc))) # <-- 修正：Device_Model 改为 DeviceModel
-        return devices
-
-    async def get_device(self, environment_id: str, device_id: str) -> DeviceModel:
-        """Retrieves a single device."""
-        device_doc = await self.devices_collection.find_one({"environment_id": environment_id, "device_id": device_id})
-        if not device_doc:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Device '{device_id}' not found in this environment.")
-        return DeviceModel(**remove_mongo_id(device_doc))
-
-    async def update_device(self, environment_id: str, device_id: str, update_data: DeviceUpdateRequest) -> DeviceModel:
-        """Updates an existing device."""
-        logger.info(f"Attempting to update device '{device_id}' in environment '{environment_id}'.")
-        update_doc = update_data.model_dump(exclude_unset=True)
-        if not update_doc:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No fields to update.")
-
-        update_doc["updated_at"] = datetime.utcnow()
-        result = await self.devices_collection.update_one(
-            {"environment_id": environment_id, "device_id": device_id},
-            {"$set": update_doc}
-        )
-        if result.matched_count == 0:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Device '{device_id}' not found in this environment.")
-        logger.info(f"Device '{device_id}' updated successfully.")
-
-        updated_device = await self.devices_collection.find_one({"environment_id": environment_id, "device_id": device_id})
-        return DeviceModel(**remove_mongo_id(updated_device))
-
-    async def delete_device(self, environment_id: str, device_id: str) -> Dict[str, str]:
-        """Deletes a specific device."""
-        logger.info(f"Attempting to delete device '{device_id}' in environment '{environment_id}'.")
-        result = await self.devices_collection.delete_one({"environment_id": environment_id, "device_id": device_id})
+        
+        # Delete from MongoDB
+        result = await self.collection.delete_one({
+            "environment_id": environment_id,
+            "twin_id": twin_id
+        })
+        
         if result.deleted_count == 0:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Device '{device_id}' not found in this environment.")
-        logger.info(f"Device '{device_id}' deleted successfully.")
-        return {"detail": f"Device '{device_id}' deleted successfully."}
-
-
-class ModelService:
-    def __init__(self, db: AsyncIOMotorClient): # ModelService 构造函数不接收 neo4j_driver
-        self.models_collection = db["digital_twin_db"]["models"]
-        self.twins_collection = db["digital_twin_db"]["twins"] # 用于 delete_model 中的孪生检查
-
-    async def upload_model_json(self, environment_id: str, model_id: str, content: Dict[str, Any]) -> ModelSchema:
-        """Uploads a new model definition (JSON)."""
-        logger.info(f"Attempting to upload model '{model_id}' in environment '{environment_id}'.")
-
-        # 1. 检查环境是否存在
-        # Assuming you have an EnvironmentService or a direct way to check environment existence
-        # For simplicity, let's assume environments collection is accessible directly if no EnvironmentService is passed
-        env_collection = self.models_collection.database["environments"]
-        env_exists = await env_collection.find_one({"environment_id": environment_id})
-        if not env_exists:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Environment '{environment_id}' not found.")
-
-        # 2. 检查模型是否已存在
-        existing_model = await self.models_collection.find_one({"environment_id": environment_id, "model_id": model_id})
-        if existing_model:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Model '{model_id}' already exists in environment '{environment_id}'.")
-
-        # 3. 解析并验证模型数据
-        try:
-            model_data = ModelSchema(
-                model_id=model_id,
-                environment_id=environment_id,
-                display_name=content.get("display_name", model_id),
-                description=content.get("description"),
-                properties=content.get("properties", {}),
-                relationships=content.get("relationships", {}),
-                telemetry=content.get("telemetry", {}),
-                commands=content.get("commands", {})
-            )
-        except Exception as e:
-            logger.error(f"Model '{model_id}' validation failed: {e}", exc_info=True)
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Invalid model data: {e}")
-
-        # 4. 插入 MongoDB
-        try:
-            await self.models_collection.insert_one(model_data.model_dump_mongo(by_alias=True))
-            logger.info(f"Model '{model_id}' uploaded successfully to MongoDB.")
-        except DuplicateKeyError:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Model '{model_id}' already exists in environment '{environment_id}'.")
-        except Exception as e:
-            logger.critical(f"Failed to insert model '{model_id}' into MongoDB: {e}", exc_info=True)
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to upload model.")
-
-        return model_data
-
-    async def get_model(self, environment_id: str, model_id: str) -> ModelSchema:
-        """Retrieves a single model."""
-        model_doc = await self.models_collection.find_one({"environment_id": environment_id, "model_id": model_id})
-        if not model_doc:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Model '{model_id}' not found in environment '{environment_id}'.")
-        return ModelSchema(**remove_mongo_id(model_doc))
-
-    async def list_models(self, environment_id: str, skip: int = 0, limit: int = 100) -> List[ModelSchema]:
-        """Lists all models for a given environment."""
-        query = {"environment_id": environment_id}
-        cursor = self.models_collection.find(query).sort("created_at", DESCENDING).skip(skip).limit(limit)
-        models = []
-        async for model_doc in cursor:
-            models.append(ModelSchema(**remove_mongo_id(model_doc)))
-        return models
-
-    async def delete_model(self, environment_id: str, model_id: str) -> Dict[str, str]:
-        """Deletes a specific model."""
-        logger.info(f"Attempting to delete model '{model_id}' in environment '{environment_id}'.")
-
-        # 1. 检查模型是否存在
-        existing_model = await self.models_collection.find_one({"environment_id": environment_id, "model_id": model_id})
-        if not existing_model:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Model '{model_id}' not found in environment '{environment_id}'.")
-
-        # 2. 检查是否有活跃的孪生实例正在使用此模型
-        existing_twin_instance = await self.twins_collection.find_one(
-            {"environment_id": environment_id, "model_id": model_id}
+            raise ResourceNotFoundError("Twin", twin_id, environment_id)
+        
+        # Also delete relationships from MongoDB
+        await self.db["relationships"].delete_many({
+            "environment_id": environment_id,
+            "$or": [
+                {"source_twin_id": twin_id},
+                {"target_twin_id": twin_id}
+            ]
+        })
+        
+        logger.info(f"Deleted twin: {twin_id} from environment: {environment_id}")
+        return OperationResponse(
+            success=True,
+            message=f"Twin '{twin_id}' and its relationships deleted successfully"
         )
-        if existing_twin_instance:
-            logger.warning(f"Model '{model_id}' cannot be deleted as active twin instances still exist.")
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=f"Model '{model_id}' cannot be deleted as active twin instances still exist. Please delete associated twins first."
-            )
-
-        # 3. 从 MongoDB 删除模型
-        result = await self.models_collection.delete_one({"environment_id": environment_id, "model_id": model_id})
-        if result.deleted_count == 0:
-            # 理论上不会发生，因为前面已经检查过存在性
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Model '{model_id}' not found in environment '{environment_id}' during deletion.")
-        logger.info(f"Model '{model_id}' deleted successfully from MongoDB.")
-        return {"detail": f"Model '{model_id}' deleted successfully."}
 
 
 class RelationshipService:
-    def __init__(self, db: AsyncIOMotorClient, neo4j_driver: AsyncGraphDatabase):
-        self.relationships_collection = db["digital_twin_db"]["relationships"]
-        self.twins_collection = db["digital_twin_db"]["twins"] # 用于验证源和目标孪生是否存在
+    """Service for managing relationships between twins."""
+    
+    def __init__(self, db: AsyncIOMotorDatabase, neo4j_driver: AsyncGraphDatabase):
+        self.db = db
+        self.collection = db["relationships"]
         self.neo4j_driver = neo4j_driver
-
-    async def create_relationship(self, environment_id: str, rel_data: RelationshipCreateRequest) -> RelationshipModel:
-        """Creates a new relationship between two twins."""
-        logger.info(f"Attempting to create relationship '{rel_data.relationship_name}' between '{rel_data.source_twin_id}' and '{rel_data.target_twin_id}'.")
-
-        # 1. Validate if source and target twins exist in MongoDB
-        source_twin = await self.twins_collection.find_one({"environment_id": environment_id, "twin_id": rel_data.source_twin_id})
-        target_twin = await self.twins_collection.find_one({"environment_id": environment_id, "twin_id": rel_data.target_twin_id})
-
-        if not source_twin:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Source twin '{rel_data.source_twin_id}' not found in this environment.")
-        if not target_twin:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Target twin '{rel_data.target_twin_id}' not found in this environment.")
-
-        # 2. Check for existing relationship in MongoDB (optional, if you want to prevent duplicates)
-        existing_rel_mongo = await self.relationships_collection.find_one({
+    
+    async def create(self, environment_id: str, data: RelationshipCreate) -> Relationship:
+        """Create a new relationship between twins."""
+        # Validate twins exist
+        twins_collection = self.db["twins"]
+        for twin_id in [data.source_twin_id, data.target_twin_id]:
+            if not await twins_collection.count_documents({
+                "environment_id": environment_id,
+                "twin_id": twin_id
+            }, limit=1) > 0:
+                raise ResourceNotFoundError("Twin", twin_id, environment_id)
+        
+        # Check if relationship already exists
+        if await self.collection.count_documents({
             "environment_id": environment_id,
-            "source_twin_id": rel_data.source_twin_id,
-            "target_twin_id": rel_data.target_twin_id,
-            "relationship_name": rel_data.relationship_name
-        })
-        if existing_rel_mongo:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Relationship '{rel_data.relationship_name}' already exists between '{rel_data.source_twin_id}' and '{rel_data.target_twin_id}'.")
-
-
-        new_rel = RelationshipModel(
-            source_twin_id=rel_data.source_twin_id,
-            target_twin_id=rel_data.target_twin_id,
-            relationship_name=rel_data.relationship_name,
-            environment_id=environment_id
-        )
-
-        # 3. Create relationship in MongoDB
-        try:
-            insert_result = await self.relationships_collection.insert_one(new_rel.model_dump_mongo(by_alias=True))
-            logger.info(f"Relationship between '{new_rel.source_twin_id}' and '{new_rel.target_twin_id}' created in MongoDB with ID: {insert_result.inserted_id}")
-        except Exception as e:
-            logger.critical(f"Failed to insert relationship into MongoDB: {e}", exc_info=True)
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to create relationship in document database.")
-
-        # 4. Create relationship in Neo4j
+            "source_twin_id": data.source_twin_id,
+            "target_twin_id": data.target_twin_id,
+            "relationship_name": data.relationship_name
+        }, limit=1) > 0:
+            raise ResourceConflictError(
+                "Relationship",
+                f"{data.relationship_name} between {data.source_twin_id} and {data.target_twin_id}",
+                environment_id
+            )
+        
+        #relationship = Relationship(environment_id=environment_id, **data.model_dump())
+        
+        # Create in MongoDB
+        # await self.collection.insert_one(relationship.model_dump_mongo())
+        
+        # Create in Neo4j
         try:
             async with self.neo4j_driver.session() as session:
                 query = f"""
                 MATCH (a:Twin {{twin_id: $source_twin_id, environment_id: $environment_id}})
                 MATCH (b:Twin {{twin_id: $target_twin_id, environment_id: $environment_id}})
-                MERGE (a)-[r:`{rel_data.relationship_name}`]->(b)
-                SET r.environment_id = $environment_id,
-                    r.created_at = $created_at,
-                    r.updated_at = $updated_at
+                CREATE (a)-[r:`{data.relationship_name}` {{
+                    environment_id: $environment_id
+                }}]->(b)
                 RETURN r
                 """
-                await session.run(query,
-                                source_twin_id=new_rel.source_twin_id,
-                                target_twin_id=new_rel.target_twin_id,
-                                relationship_name=new_rel.relationship_name,
-                                environment_id=new_rel.environment_id,
-                                created_at=new_rel.created_at.isoformat(),
-                                updated_at=new_rel.updated_at.isoformat())
-            logger.info(f"Relationship '{new_rel.relationship_name}' between '{new_rel.source_twin_id}' and '{new_rel.target_twin_id}' created in Neo4j.")
+                await session.run(
+                    query,
+                    source_twin_id=data.source_twin_id,
+                    target_twin_id=data.target_twin_id,
+                    environment_id=environment_id,
+
+                )
         except Exception as e:
-            logger.critical(f"Failed to create relationship in Neo4j: {e}. Data inconsistency: Relationship created in MongoDB but not Neo4j.", exc_info=True)
-            # Rollback MongoDB insertion if Neo4j fails
-            await self.relationships_collection.delete_one({"_id": insert_result.inserted_id})
-            logger.warning(f"Rolled back MongoDB relationship creation due to Neo4j failure.")
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to create relationship in graph database. Data rolled back in document database.")
-
-        return new_rel
-
-    async def delete_relationship(self, environment_id: str, source_twin_id: str, target_twin_id: str, relationship_name: str) -> Dict[str, str]:
-        """Deletes a relationship between two twins."""
-        logger.info(f"Attempting to delete relationship '{relationship_name}' from '{source_twin_id}' to '{target_twin_id}'.")
-
-        # 1. Delete relationship from MongoDB
-        mongo_result = await self.relationships_collection.delete_one({
+            # # Rollback MongoDB operation
+            # await self.collection.delete_one({
+            #     "environment_id": environment_id,
+            #     "source_twin_id": data.source_twin_id,
+            #     "target_twin_id": data.target_twin_id,
+            #     "relationship_name": data.relationship_name
+            # })
+            logger.error(f"Failed to create relationship in Neo4j: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to create relationship in graph database"
+            )
+        
+        logger.info(f"Created relationship: {data.relationship_name} in environment: {environment_id}")
+        return relationship
+    
+    # TODO：是否有必要有这个函数？
+    async def get(self, environment_id: str, source_twin_id: str, 
+                  target_twin_id: str, relationship_name: str) -> Relationship:
+        """Get a specific relationship."""
+        doc = await self.collection.find_one({
             "environment_id": environment_id,
             "source_twin_id": source_twin_id,
             "target_twin_id": target_twin_id,
             "relationship_name": relationship_name
         })
-        if mongo_result.deleted_count == 0:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Relationship '{relationship_name}' from '{source_twin_id}' to '{target_twin_id}' not found.")
-        logger.info(f"Relationship deleted from MongoDB.")
-
-        # 2. Delete relationship from Neo4j
+        if not doc:
+            raise ResourceNotFoundError(
+                "Relationship",
+                f"{relationship_name} between {source_twin_id} and {target_twin_id}",
+                environment_id
+            )
+        return Relationship(**remove_mongo_id(doc))
+    
+    async def list(self, environment_id: str, twin_id: Optional[str] = None,
+                   skip: int = 0, limit: int = 100) -> PaginatedResponse[Relationship]:
+        """List relationships in an environment."""
+        query = {"environment_id": environment_id}
+        if twin_id:
+            query["$or"] = [
+                {"source_twin_id": twin_id},
+                {"target_twin_id": twin_id}
+            ]
+        
+        total_count = await self.collection.count_documents(query)
+        
+        cursor = self.collection.find(query).sort("created_at", DESCENDING).skip(skip).limit(limit)
+        items = [Relationship(**remove_mongo_id(doc)) async for doc in cursor]
+        
+        return PaginatedResponse(
+            items=items,
+            total_count=total_count,
+            page=skip // limit + 1,
+            page_size=limit,
+            has_next=skip + limit < total_count,
+            has_previous=skip > 0
+        )
+    
+    async def delete(self, environment_id: str, source_twin_id: str,
+                     target_twin_id: str, relationship_name: str) -> OperationResponse:
+        """Delete a relationship."""
+        # Delete from Neo4j
         try:
             async with self.neo4j_driver.session() as session:
                 query = f"""
-                MATCH (a:Twin {{twin_id: $source_twin_id, environment_id: $environment_id}})-[r:`{relationship_name}`]->(b:Twin {{twin_id: $target_twin_id, environment_id: $environment_id}})
+                MATCH (a:Twin {{twin_id: $source_twin_id, environment_id: $environment_id}})
+                      -[r:`{relationship_name}`]->
+                      (b:Twin {{twin_id: $target_twin_id, environment_id: $environment_id}})
                 DELETE r
+                RETURN count(r) AS deleted_count
                 """
-                await session.run(query,
-                                source_twin_id=source_twin_id,
-                                target_twin_id=target_twin_id,
-                                environment_id=environment_id)
-                logger.info(f"Relationship '{relationship_name}' deleted from Neo4j.")
+                result = await session.run(
+                    query,
+                    source_twin_id=source_twin_id,
+                    target_twin_id=target_twin_id,
+                    environment_id=environment_id
+                )
+                record = await result.single()
+                if record and record["deleted_count"] == 0:
+                    logger.warning(f"Relationship not found in Neo4j")
         except Exception as e:
-            logger.error(f"Failed to delete relationship from Neo4j: {e}. Data inconsistency: Relationship deleted from MongoDB but not Neo4j.", exc_info=True)
+            logger.error(f"Failed to delete relationship from Neo4j: {e}")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Failed to delete relationship from graph database: {e}. Data is inconsistent. Please contact support."
+                detail="Failed to delete relationship from graph database"
             )
-
-        return {"detail": f"Relationship '{relationship_name}' deleted successfully."}
-
-    async def list_relationships(self, environment_id: str, twin_id: Optional[str] = None) -> List[RelationshipModel]:
-        """Lists all relationships for an environment, optionally filtered by a specific twin."""
-        query = {"environment_id": environment_id}
-        if twin_id:
-            # Find relationships where the twin is either source or target
-            query = {
-                "environment_id": environment_id,
-                "$or": [{"source_twin_id": twin_id}, {"target_twin_id": twin_id}]
-            }
-        cursor = self.relationships_collection.find(query).sort("created_at", DESCENDING)
-        relationships = []
-        async for rel_doc in cursor:
-            relationships.append(RelationshipModel(**remove_mongo_id(rel_doc)))
-        return relationships
-
-
-class TelemetryService:
-    def __init__(self, influxdb_client: InfluxDBClient, bucket: str, org: str):
-        self.influxdb_client = influxdb_client
-        self.bucket = bucket
-        self.org = org
-        self.write_api = influxdb_client.write_api()
-        self.query_api = influxdb_client.query_api()
-
-    async def write_telemetry(self, telemetry_data: Telemetry):
-        """Writes telemetry data to InfluxDB."""
-        logger.info(f"Writing telemetry for device '{telemetry_data.device_id}' in environment '{telemetry_data.environment_id}'.")
-        point = {
-            "measurement": "telemetry",
-            "tags": {
-                "device_id": telemetry_data.device_id,
-                "environment_id": telemetry_data.environment_id,
-                "location": telemetry_data.location
-            },
-            "fields": telemetry_data.properties,
-            "time": datetime.utcnow().isoformat() + "Z" # Use current UTC time for timestamp
-        }
-        try:
-            await run_in_threadpool(self.write_api.write, self.bucket, self.org, point)
-            logger.info(f"Telemetry for device '{telemetry_data.device_id}' written to InfluxDB.")
-        except Exception as e:
-            logger.critical(f"Failed to write telemetry for device '{telemetry_data.device_id}' to InfluxDB: {e}", exc_info=True)
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to write telemetry data.")
-
-    async def query_telemetry(
-        self,
-        environment_id: str,
-        device_id: str,
-        start_time: str,
-        end_time: Optional[str] = None,
-        field: Optional[str] = None
-    ) -> List[Dict[str, Any]]:
-        """Queries telemetry data from InfluxDB."""
-        logger.info(f"Querying telemetry for device '{device_id}' in environment '{environment_id}'.")
-
-        flux_query = f'''
-        from(bucket: "{self.bucket}")
-        |> range(start: {start_time}, stop: {end_time if end_time else "now()"})
-        |> filter(fn: (r) => r["_measurement"] == "telemetry")
-        |> filter(fn: (r) => r["device_id"] == "{device_id}")
-        |> filter(fn: (r) => r["environment_id"] == "{environment_id}")
-        '''
-        if field:
-            flux_query += f'|> filter(fn: (r) => r["_field"] == "{field}")'
         
-        flux_query += '|> yield(name: "results")'
+        # # Delete from MongoDB
+        # result = await self.collection.delete_one({
+        #     "environment_id": environment_id,
+        #     "source_twin_id": source_twin_id,
+        #     "target_twin_id": target_twin_id,
+        #     "relationship_name": relationship_name
+        # })
+        
+        # if result.deleted_count == 0:
+        #     raise ResourceNotFoundError(
+        #         "Relationship",
+        #         f"{relationship_name} between {source_twin_id} and {target_twin_id}",
+        #         environment_id
+        #     )
+        
+        logger.info(f"Deleted relationship: {relationship_name} from environment: {environment_id}")
+        return OperationResponse(
+            success=True,
+            message=f"Relationship '{relationship_name}' deleted successfully"
+        )
 
+class WorkflowService(BaseService):
+    """Service for managing workflows."""
+    
+    collection_name = "workflows"
+    
+    def validate_yaml_content(self, content: str) -> Dict[str, Any]:
+        """Validate and parse YAML content."""
         try:
-            # run_in_threadpool because InfluxDB client is not async
-            tables = await run_in_threadpool(self.query_api.query, flux_query, org=self.org)
-            results = []
-            for table in tables:
-                for record in table.records:
-                    results.append({
-                        "time": record.get_time().isoformat(),
-                        "field": record.get_field(),
-                        "value": record.get_value(),
-                        "device_id": record.values.get("device_id"),
-                        "environment_id": record.values.get("environment_id"),
-                        "location": record.values.get("location")
-                    })
-            logger.info(f"Successfully queried telemetry for device '{device_id}'. Found {len(results)} records.")
-            return results
-        except Exception as e:
-            logger.critical(f"Failed to query telemetry for device '{device_id}' from InfluxDB: {e}", exc_info=True)
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to query telemetry data.")
-
-
-class WorkflowService:
-    def __init__(self, db: AsyncIOMotorClient):
-        self.workflows_collection = db["digital_twin_db"]["workflows"]
-
-    async def upload_workflow(self, environment_id: str, workflow_id: str, file_name: str, content: bytes) -> WorkflowSchema:
-        logger.info(f"Attempting to upload workflow '{workflow_id}' in environment '{environment_id}'.")
-
-        # Basic YAML validation
+            yaml_data = yaml.safe_load(content)
+            if yaml_data is None:
+                raise ValidationError("YAML content is empty")
+            if not isinstance(yaml_data, dict):
+                raise ValidationError("YAML content must be a dictionary")
+            return yaml_data
+        except yaml.YAMLError as e:
+            raise ValidationError(f"Invalid YAML syntax: {e}")
+    
+    def calculate_checksum(self, content: str) -> str:
+        """Calculate SHA256 checksum of content."""
+        return hashlib.sha256(content.encode('utf-8')).hexdigest()
+    
+    async def create(self, environment_id: str, data: WorkflowCreate) -> Workflow:
+        """Create a new workflow."""
+        # Check environment exists
+        if not await self.check_environment_exists(environment_id):
+            raise ResourceNotFoundError("Environment", environment_id)
+        
+        # Check if workflow already exists
+        if await self.collection.count_documents({
+            "environment_id": environment_id,
+            "workflow_id": data.workflow_id
+        }, limit=1) > 0:
+            raise ResourceConflictError("Workflow", data.workflow_id, environment_id)
+        
+        # Validate YAML content
+        self.validate_yaml_content(data.content)
+        
+        workflow = Workflow(
+            environment_id=environment_id,
+            **data.model_dump(),
+            file_size=len(data.content.encode('utf-8')),
+            checksum=self.calculate_checksum(data.content)
+        )
+        
+        await self.collection.insert_one(workflow.model_dump_mongo())
+        
+        logger.info(f"Created workflow: {data.workflow_id} in environment: {environment_id}")
+        return workflow
+    
+    async def upload(self, environment_id: str, workflow_id: str, 
+                     file_name: str, content: bytes) -> Workflow:
+        """Upload a workflow from file."""
+        # Decode content
         try:
             yaml_content = content.decode('utf-8')
-            yaml.safe_load(yaml_content)
-        except Exception as e:
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Invalid YAML content: {e}")
-
-        existing_workflow = await self.workflows_collection.find_one({"environment_id": environment_id, "workflow_id": workflow_id})
-        if existing_workflow:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Workflow '{workflow_id}' already exists in environment '{environment_id}'.")
-
-        new_workflow = WorkflowSchema(
+        except UnicodeDecodeError:
+            raise ValidationError("File content is not valid UTF-8")
+        
+        # Create workflow
+        data = WorkflowCreate(
             workflow_id=workflow_id,
-            environment_id=environment_id,
             file_name=file_name,
             content=yaml_content
         )
-
-        try:
-            await self.workflows_collection.insert_one(new_workflow.model_dump_mongo(by_alias=True))
-            logger.info(f"Workflow '{workflow_id}' uploaded successfully.")
-        except Exception as e:
-            logger.critical(f"Failed to upload workflow '{workflow_id}': {e}", exc_info=True)
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to upload workflow.")
-
-        return new_workflow
-
-    async def delete_workflow(self, environment_id: str, workflow_id: str) -> Dict[str, str]:
-        logger.info(f"Attempting to delete workflow '{workflow_id}' in environment '{environment_id}'.")
-        result = await self.workflows_collection.delete_one({"environment_id": environment_id, "workflow_id": workflow_id})
+        
+        return await self.create(environment_id, data)
+    
+    async def get(self, environment_id: str, workflow_id: str) -> Workflow:
+        """Get a workflow by ID."""
+        doc = await self.collection.find_one({
+            "environment_id": environment_id,
+            "workflow_id": workflow_id
+        })
+        if not doc:
+            raise ResourceNotFoundError("Workflow", workflow_id, environment_id)
+        return Workflow(**remove_mongo_id(doc))
+    
+    async def list(self, environment_id: str, status: Optional[WorkflowStatus] = None,
+                   workflow_type: Optional[WorkflowType] = None,
+                   skip: int = 0, limit: int = 100) -> PaginatedResponse[WorkflowSummary]:
+        """List workflows in an environment."""
+        query = {"environment_id": environment_id}
+        if status:
+            query["status"] = status.value
+        if workflow_type:
+            query["workflow_type"] = workflow_type.value
+        
+        total_count = await self.collection.count_documents(query)
+        
+        cursor = self.collection.find(query).sort("created_at", DESCENDING).skip(skip).limit(limit)
+        
+        # Convert to summaries (without content)
+        items = []
+        async for doc in cursor:
+            workflow = Workflow(**remove_mongo_id(doc))
+            summary = WorkflowSummary(
+                workflow_id=workflow.workflow_id,
+                environment_id=workflow.environment_id,
+                file_name=workflow.file_name,
+                workflow_type=workflow.workflow_type,
+                status=workflow.status,
+                description=workflow.description,
+                version=workflow.version,
+                tags=workflow.tags,
+                created_at=workflow.created_at,
+                updated_at=workflow.updated_at,
+                last_executed=workflow.last_executed,
+                execution_count=workflow.execution_count,
+                file_size=workflow.file_size
+            )
+            items.append(summary)
+        
+        return PaginatedResponse(
+            items=items,
+            total_count=total_count,
+            page=skip // limit + 1,
+            page_size=limit,
+            has_next=skip + limit < total_count,
+            has_previous=skip > 0
+        )
+    
+    async def update(self, environment_id: str, workflow_id: str, data: WorkflowUpdate) -> Workflow:
+        """Update a workflow."""
+        update_data = data.model_dump(exclude_unset=True)
+        if not update_data:
+            raise ValidationError("No fields to update")
+        
+        # If updating content, validate and update metadata
+        if "content" in update_data:
+            self.validate_yaml_content(update_data["content"])
+            update_data["file_size"] = len(update_data["content"].encode('utf-8'))
+            update_data["checksum"] = self.calculate_checksum(update_data["content"])
+        
+        update_data["updated_at"] = datetime.utcnow()
+        
+        result = await self.collection.update_one(
+            {"environment_id": environment_id, "workflow_id": workflow_id},
+            {"$set": update_data}
+        )
+        
+        if result.matched_count == 0:
+            raise ResourceNotFoundError("Workflow", workflow_id, environment_id)
+        
+        return await self.get(environment_id, workflow_id)
+    
+    async def delete(self, environment_id: str, workflow_id: str) -> OperationResponse:
+        """Delete a workflow."""
+        result = await self.collection.delete_one({
+            "environment_id": environment_id,
+            "workflow_id": workflow_id
+        })
+        
         if result.deleted_count == 0:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Workflow '{workflow_id}' not found in this environment.")
-        logger.info(f"Workflow '{workflow_id}' deleted successfully.")
-        return {"detail": f"Workflow '{workflow_id}' deleted successfully."}
-
-    async def list_workflows(self, environment_id: str) -> WorkflowListResponse:
-        logger.info(f"Listing workflows for environment '{environment_id}'.")
-        workflows = []
-        cursor = self.workflows_collection.find({"environment_id": environment_id}).sort("created_at", DESCENDING)
-        async for wf_doc in cursor:
-            workflows.append(WorkflowSchema(**remove_mongo_id(wf_doc)))
-        logger.info(f"Found {len(workflows)} workflows for environment '{environment_id}'.")
-        return WorkflowListResponse(workflows=workflows)
-
-    async def view_workflow(self, environment_id: str, workflow_id: str) -> WorkflowViewResponse:
-        logger.info(f"Viewing workflow '{workflow_id}' in environment '{environment_id}'.")
-        workflow_doc = await self.workflows_collection.find_one({"environment_id": environment_id, "workflow_id": workflow_id})
-        if not workflow_doc:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Workflow '{workflow_id}' not found in this environment.")
-        return WorkflowViewResponse(
-            workflow_id=workflow_doc["workflow_id"],
-            file_name=workflow_doc["file_name"],
-            content=workflow_doc["content"]
+            raise ResourceNotFoundError("Workflow", workflow_id, environment_id)
+        
+        logger.info(f"Deleted workflow: {workflow_id} from environment: {environment_id}")
+        return OperationResponse(
+            success=True,
+            message=f"Workflow '{workflow_id}' deleted successfully"
+        )
+    
+    async def activate(self, environment_id: str, workflow_id: str) -> Workflow:
+        """Activate a workflow."""
+        return await self.update(
+            environment_id,
+            workflow_id,
+            WorkflowUpdate(status=WorkflowStatus.ACTIVE)
+        )
+    
+    async def deactivate(self, environment_id: str, workflow_id: str) -> Workflow:
+        """Deactivate a workflow."""
+        return await self.update(
+            environment_id,
+            workflow_id,
+            WorkflowUpdate(status=WorkflowStatus.INACTIVE)
         )
 
 
-# --- Dependency Injection Functions ---
-async def get_db(request: Request) -> AsyncIOMotorClient:
-    return request.app.state.clients.mongo["digital_twin_db"]
+app = FastAPI(
+    title=settings.API_TITLE,
+    version=settings.API_VERSION,
+    docs_url="/docs",
+    redoc_url="/redoc"
+)
 
-async def get_neo4j_driver(request: Request) -> AsyncGraphDatabase: # <-- 修正：使用 AsyncGraphDatabase
-    return request.app.state.clients.neo4j
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-async def get_kafka_producer(request: Request) -> AIOKafkaProducer:
-    return request.app.state.clients.kafka_producer
+# Database clients
+db_clients = DatabaseClients()
 
-async def get_influxdb_client(request: Request) -> InfluxDBClient:
-    return request.app.state.clients.influxdb_client
+@app.on_event("startup")
+async def startup():
+    """Initialize application on startup."""
+    await db_clients.initialize()
+    logger.info("Application started successfully")
 
-async def get_environment_service(
-    db: AsyncIOMotorClient = Depends(get_db),
-    twin_service: 'TwinService' = Depends(lambda db, neo4j: TwinService(db, neo4j), use_cache=True), # <-- 修正：明确依赖注入
-    model_service: 'ModelService' = Depends(lambda db: ModelService(db), use_cache=True), # <-- 修正：明确依赖注入
-    device_service: 'DeviceService' = Depends(lambda db: DeviceService(db), use_cache=True) # <-- 修正：明确依赖注入
-) -> EnvironmentService:
-    # 延迟导入以避免循环依赖或在 FastAPI 应用程序启动时处理
-    # from .services.environment_service import EnvironmentService # 假设在单独文件中
-    # return EnvironmentService(db, neo4j_driver, twin_service, model_service, device_service)
-    # 由于所有服务都在一个文件中，直接创建实例
-    return EnvironmentService(db, twin_service, model_service, device_service)
+@app.on_event("shutdown")
+async def shutdown():
+    """Cleanup on shutdown."""
+    await db_clients.cleanup()
+    logger.info("Application shutdown complete")
 
+# --- Dependency Injection ---
+def get_db() -> AsyncIOMotorDatabase:
+    """Get MongoDB database instance."""
+    return db_clients.mongo_db
 
-async def get_model_service(db: AsyncIOMotorClient = Depends(get_db)) -> ModelService:
-    return ModelService(db)
+def get_neo4j_driver() -> AsyncGraphDatabase:
+    """Get Neo4j driver instance."""
+    return db_clients.neo4j_driver
 
+def get_kafka_producer() -> AIOKafkaProducer:
+    """Get Kafka producer instance."""
+    return db_clients.kafka_producer
+
+def get_influxdb_client() -> InfluxDBClient:
+    """Get InfluxDB client instance."""
+    return db_clients.influxdb_client
+
+# Service dependencies
 async def get_twin_service(
-    db: AsyncIOMotorClient = Depends(get_db),
-    neo4j_driver: AsyncGraphDatabase = Depends(get_neo4j_driver) # <-- 修正：使用 AsyncGraphDatabase
+    db: AsyncIOMotorDatabase = Depends(get_db),
+    neo4j_driver: AsyncGraphDatabase = Depends(get_neo4j_driver)
 ) -> TwinService:
     return TwinService(db, neo4j_driver)
 
-async def get_device_service(db: AsyncIOMotorClient = Depends(get_db)) -> DeviceService:
+async def get_environment_service(
+    db: AsyncIOMotorDatabase = Depends(get_db),
+    twin_service: TwinService = Depends(get_twin_service)
+) -> EnvironmentService:
+    return EnvironmentService(db, twin_service)
+
+async def get_model_service(db: AsyncIOMotorDatabase = Depends(get_db)) -> ModelService:
+    return ModelService(db)
+
+async def get_device_service(db: AsyncIOMotorDatabase = Depends(get_db)) -> DeviceService:
     return DeviceService(db)
 
 async def get_relationship_service(
-    db: AsyncIOMotorClient = Depends(get_db),
-    neo4j_driver: AsyncGraphDatabase = Depends(get_neo4j_driver) # <-- 修正：使用 AsyncGraphDatabase
+    db: AsyncIOMotorDatabase = Depends(get_db),
+    neo4j_driver: AsyncGraphDatabase = Depends(get_neo4j_driver)
 ) -> RelationshipService:
     return RelationshipService(db, neo4j_driver)
 
-async def get_telemetry_service(
-    influxdb_client: InfluxDBClient = Depends(get_influxdb_client)
-) -> TelemetryService:
-    return TelemetryService(influxdb_client, settings.INFLUXDB_BUCKET, settings.INFLUXDB_ORG)
-
-async def get_workflow_service(db: AsyncIOMotorClient = Depends(get_db)) -> WorkflowService:
+async def get_workflow_service(db: AsyncIOMotorDatabase = Depends(get_db)) -> WorkflowService:
     return WorkflowService(db)
 
-
-# 初始化路由时只设置tags，不设置prefix
-environment_router = APIRouter(tags=["Environments"])
-model_router = APIRouter(tags=["Models"])
-twin_router = APIRouter(tags=["Twins"])
-device_router = APIRouter(tags=["Devices"])
-relationship_router = APIRouter(tags=["Relationships"])
-telemetry_router = APIRouter(tags=["Telemetry"])
-workflow_router = APIRouter(tags=["Workflows"])
-
-
-# --- Environment API Endpoints ---
-@environment_router.post("", response_model=EnvironmentModel, status_code=status.HTTP_201_CREATED)
-async def create_environment_api(
-    env_data: EnvironmentCreateRequest,
-    environment_service: EnvironmentService = Depends(get_environment_service)
+# --- API Routes ---
+# Environment endpoints
+@app.post("/environments", response_model=Environment, status_code=status.HTTP_201_CREATED, tags=["Environments"])
+async def create_environment(
+    data: EnvironmentCreate,
+    service: EnvironmentService = Depends(get_environment_service)
 ):
-    """Creates a new digital twin environment."""
-    return await environment_service.create_environment(env_data)
+    """Create a new digital twin environment."""
+    return await service.create(data)
 
-@environment_router.get("", response_model=List[EnvironmentModel])
-async def list_environments_api(
-    environment_service: EnvironmentService = Depends(get_environment_service),
+@app.get("/environments", response_model=PaginatedResponse[Environment], tags=["Environments"])
+async def list_environments(
     skip: int = Query(0, ge=0),
-    limit: int = Query(100, le=1000)
+    limit: int = Query(settings.DEFAULT_PAGE_SIZE, ge=1, le=settings.MAX_PAGE_SIZE),
+    service: EnvironmentService = Depends(get_environment_service)
 ):
-    """Lists all digital twin environments."""
-    return await environment_service.list_environments(skip, limit)
+    """List all digital twin environments."""
+    return await service.list(skip, limit)
 
-@environment_router.get("/{environment_id}", response_model=EnvironmentModel)
-async def get_environment_api(
-    environment_id: str,
-    environment_service: EnvironmentService = Depends(get_environment_service)
+@app.get("/environments/{environment_id}", response_model=Environment, tags=["Environments"])
+async def get_environment(
+    environment_id: str = Path(..., description="Environment identifier"),
+    service: EnvironmentService = Depends(get_environment_service)
 ):
-    """Retrieves a specific digital twin environment by ID."""
-    return await environment_service.get_environment(environment_id)
+    """Get a specific digital twin environment."""
+    return await service.get(environment_id)
 
-@environment_router.put("/{environment_id}", response_model=EnvironmentModel)
-async def update_environment_api(
-    environment_id: str,
-    update_data: EnvironmentUpdateRequest,
-    environment_service: EnvironmentService = Depends(get_environment_service)
+@app.put("/environments/{environment_id}", response_model=Environment, tags=["Environments"])
+async def update_environment(
+    environment_id: str = Path(..., description="Environment identifier"),
+    data: EnvironmentUpdate = Body(...),
+    service: EnvironmentService = Depends(get_environment_service)
 ):
-    """Updates an existing digital twin environment."""
-    return await environment_service.update_environment(environment_id, update_data)
+    """Update a digital twin environment."""
+    return await service.update(environment_id, data)
 
-@environment_router.delete("/{environment_id}", status_code=status.HTTP_200_OK)
-async def delete_environment_api(
-    environment_id: str,
-    environment_service: EnvironmentService = Depends(get_environment_service)
+@app.delete("/environments/{environment_id}", response_model=OperationResponse, tags=["Environments"])
+async def delete_environment(
+    environment_id: str = Path(..., description="Environment identifier"),
+    service: EnvironmentService = Depends(get_environment_service)
 ):
-    """Deletes a digital twin environment and all its contents (twins, models, devices, relationships)."""
-    return await environment_service.delete_environment(environment_id)
+    """Delete a digital twin environment and all its resources."""
+    return await service.delete(environment_id)
 
-# --- Model API Endpoints ---
-@model_router.post("", response_model=ModelSchema, status_code=status.HTTP_201_CREATED)
-async def upload_model_api(
-    environment_id: str,
-    model_id: str,
-    content: Dict[str, Any],
-    model_service: ModelService = Depends(get_model_service)
+# Model endpoints
+@app.post("/environments/{environment_id}/models", response_model=Model, status_code=status.HTTP_201_CREATED, tags=["Models"])
+async def create_model(
+    environment_id: str = Path(..., description="Environment identifier"),
+    data: ModelCreate = Body(...),
+    service: ModelService = Depends(get_model_service)
 ):
-    """Uploads a new model definition (JSON)."""
-    return await model_service.upload_model_json(environment_id, model_id, content)
+    """Create a new model definition."""
+    return await service.create(environment_id, data)
 
-@model_router.get("/{model_id}", response_model=ModelSchema)
-async def get_model_api(
-    environment_id: str,
-    model_id: str,
-    model_service: ModelService = Depends(get_model_service)
-):
-    """Retrieves a specific model by ID."""
-    return await model_service.get_model(environment_id, model_id)
-
-@model_router.get("", response_model=List[ModelSchema])
-async def list_models_api(
-    environment_id: str,
-    model_service: ModelService = Depends(get_model_service),
+@app.get("/environments/{environment_id}/models", response_model=PaginatedResponse[Model], tags=["Models"])
+async def list_models(
+    environment_id: str = Path(..., description="Environment identifier"),
     skip: int = Query(0, ge=0),
-    limit: int = Query(100, le=1000)
+    limit: int = Query(settings.DEFAULT_PAGE_SIZE, ge=1, le=settings.MAX_PAGE_SIZE),
+    service: ModelService = Depends(get_model_service)
 ):
-    """Lists all models for a given environment."""
-    return await model_service.list_models(environment_id, skip, limit)
+    """List all models in an environment."""
+    return await service.list(environment_id, skip, limit)
 
-@model_router.delete("/{model_id}", status_code=status.HTTP_200_OK)
-async def delete_model_api(
-    environment_id: str,
-    model_id: str,
-    model_service: ModelService = Depends(get_model_service)
+@app.get("/environments/{environment_id}/models/{model_id}", response_model=Model, tags=["Models"])
+async def get_model(
+    environment_id: str = Path(..., description="Environment identifier"),
+    model_id: str = Path(..., description="Model identifier"),
+    service: ModelService = Depends(get_model_service)
 ):
-    """Deletes a specific model. Fails if active twin instances use this model."""
-    return await model_service.delete_model(environment_id, model_id)
+    """Get a specific model."""
+    return await service.get(environment_id, model_id)
 
-# --- Twin API Endpoints ---
-@twin_router.post("", response_model=TwinSchema, status_code=status.HTTP_201_CREATED)
-async def create_twin_api(
-    environment_id: str,
-    twin_data: TwinCreateRequest,
-    twin_service: TwinService = Depends(get_twin_service)
+@app.put("/environments/{environment_id}/models/{model_id}", response_model=Model, tags=["Models"])
+async def update_model(
+    environment_id: str = Path(..., description="Environment identifier"),
+    model_id: str = Path(..., description="Model identifier"),
+    data: ModelUpdate = Body(...),
+    service: ModelService = Depends(get_model_service)
 ):
-    """Creates a new digital twin instance."""
-    return await twin_service.create_twin(environment_id, twin_data)
+    """Update a model."""
+    return await service.update(environment_id, model_id, data)
 
-@twin_router.get("/{twin_id}", response_model=TwinSchema)
-async def get_twin_api(
-    environment_id: str,
-    twin_id: str,
-    twin_service: TwinService = Depends(get_twin_service)
+@app.delete("/environments/{environment_id}/models/{model_id}", response_model=OperationResponse, tags=["Models"])
+async def delete_model(
+    environment_id: str = Path(..., description="Environment identifier"),
+    model_id: str = Path(..., description="Model identifier"),
+    service: ModelService = Depends(get_model_service)
 ):
-    """Retrieves a specific twin by ID."""
-    return await twin_service.get_twin(environment_id, twin_id)
+    """Delete a model. Fails if twins exist using this model."""
+    return await service.delete(environment_id, model_id)
 
-@twin_router.get("", response_model=List[TwinSchema])
-async def list_twins_api(
-    environment_id: str,
-    twin_service: TwinService = Depends(get_twin_service),
-    model_id: Optional[str] = Query(None),
+# Twin endpoints
+@app.post("/environments/{environment_id}/twins", response_model=Twin, status_code=status.HTTP_201_CREATED, tags=["Twins"])
+async def create_twin(
+    environment_id: str = Path(..., description="Environment identifier"),
+    data: TwinCreate = Body(...),
+    service: TwinService = Depends(get_twin_service)
+):
+    """Create a new digital twin instance."""
+    return await service.create(environment_id, data)
+
+@app.get("/environments/{environment_id}/twins", response_model=PaginatedResponse[Twin], tags=["Twins"])
+async def list_twins(
+    environment_id: str = Path(..., description="Environment identifier"),
+    model_id: Optional[str] = Query(None, description="Filter by model ID"),
     skip: int = Query(0, ge=0),
-    limit: int = Query(100, le=1000)
+    limit: int = Query(settings.DEFAULT_PAGE_SIZE, ge=1, le=settings.MAX_PAGE_SIZE),
+    service: TwinService = Depends(get_twin_service)
 ):
-    """Lists all twins for a given environment, with optional model filtering."""
-    return await twin_service.list_twins(environment_id, model_id, skip, limit)
+    """List all twins in an environment."""
+    return await service.list(environment_id, model_id, skip, limit)
 
-@twin_router.put("/{twin_id}", response_model=TwinSchema)
-async def update_twin_api(
-    environment_id: str,
-    twin_id: str,
-    update_data: TwinUpdateRequest,
-    twin_service: TwinService = Depends(get_twin_service)
+@app.get("/environments/{environment_id}/twins/{twin_id}", response_model=Twin, tags=["Twins"])
+async def get_twin(
+    environment_id: str = Path(..., description="Environment identifier"),
+    twin_id: str = Path(..., description="Twin identifier"),
+    service: TwinService = Depends(get_twin_service)
 ):
-    """Updates an existing digital twin instance."""
-    return await twin_service.update_twin(environment_id, twin_id, update_data)
+    """Get a specific twin."""
+    return await service.get(environment_id, twin_id)
 
-@twin_router.delete("/{twin_id}", status_code=status.HTTP_200_OK)
-async def delete_twin_api(
-    environment_id: str,
-    twin_id: str,
-    twin_service: TwinService = Depends(get_twin_service)
+@app.put("/environments/{environment_id}/twins/{twin_id}", response_model=Twin, tags=["Twins"])
+async def update_twin(
+    environment_id: str = Path(..., description="Environment identifier"),
+    twin_id: str = Path(..., description="Twin identifier"),
+    data: TwinUpdate = Body(...),
+    service: TwinService = Depends(get_twin_service)
 ):
-    """Deletes a specific twin."""
-    return await twin_service.delete_twin(environment_id, twin_id)
+    """Update a twin."""
+    return await service.update(environment_id, twin_id, data)
 
-# --- Device API Endpoints ---
-@device_router.post("", response_model=DeviceModel, status_code=status.HTTP_201_CREATED)
-async def create_device_api(
-    environment_id: str,
-    device_data: DeviceCreateRequest,
-    device_service: DeviceService = Depends(get_device_service)
+@app.delete("/environments/{environment_id}/twins/{twin_id}", response_model=OperationResponse, tags=["Twins"])
+async def delete_twin(
+    environment_id: str = Path(..., description="Environment identifier"),
+    twin_id: str = Path(..., description="Twin identifier"),
+    service: TwinService = Depends(get_twin_service)
 ):
-    """Creates a new device."""
-    return await device_service.create_device(environment_id, device_data)
+    """Delete a twin and its relationships."""
+    return await service.delete(environment_id, twin_id)
 
-@device_router.get("/{device_id}", response_model=DeviceModel)
-async def get_device_api(
-    environment_id: str,
-    device_id: str,
-    device_service: DeviceService = Depends(get_device_service)
+# Device endpoints
+@app.post("/environments/{environment_id}/devices", response_model=Device, status_code=status.HTTP_201_CREATED, tags=["Devices"])
+async def create_device(
+    environment_id: str = Path(..., description="Environment identifier"),
+    data: DeviceCreate = Body(...),
+    service: DeviceService = Depends(get_device_service)
 ):
-    """Retrieves a specific device by ID."""
-    return await device_service.get_device(environment_id, device_id)
+    """Create a new device."""
+    return await service.create(environment_id, data)
 
-@device_router.get("", response_model=List[DeviceModel])
-async def list_devices_api(
-    environment_id: str,
-    device_service: DeviceService = Depends(get_device_service),
+@app.get("/environments/{environment_id}/devices", response_model=PaginatedResponse[Device], tags=["Devices"])
+async def list_devices(
+    environment_id: str = Path(..., description="Environment identifier"),
     skip: int = Query(0, ge=0),
-    limit: int = Query(100, le=1000)
+    limit: int = Query(settings.DEFAULT_PAGE_SIZE, ge=1, le=settings.MAX_PAGE_SIZE),
+    service: DeviceService = Depends(get_device_service)
 ):
-    """Lists all devices for a given environment."""
-    return await device_service.list_devices(environment_id, skip, limit)
+    """List all devices in an environment."""
+    return await service.list(environment_id, skip, limit)
 
-@device_router.put("/{device_id}", response_model=DeviceModel)
-async def update_device_api(
-    environment_id: str,
-    device_id: str,
-    update_data: DeviceUpdateRequest,
-    device_service: DeviceService = Depends(get_device_service)
+@app.get("/environments/{environment_id}/devices/{device_id}", response_model=Device, tags=["Devices"])
+async def get_device(
+    environment_id: str = Path(..., description="Environment identifier"),
+    device_id: str = Path(..., description="Device identifier"),
+    service: DeviceService = Depends(get_device_service)
 ):
-    """Updates an existing device."""
-    return await device_service.update_device(environment_id, device_id, update_data)
+    """Get a specific device."""
+    return await service.get(environment_id, device_id)
 
-@device_router.delete("/{device_id}", status_code=status.HTTP_200_OK)
-async def delete_device_api(
-    environment_id: str,
-    device_id: str,
-    device_service: DeviceService = Depends(get_device_service)
+@app.put("/environments/{environment_id}/devices/{device_id}", response_model=Device, tags=["Devices"])
+async def update_device(
+    environment_id: str = Path(..., description="Environment identifier"),
+    device_id: str = Path(..., description="Device identifier"),
+    data: DeviceUpdate = Body(...),
+    service: DeviceService = Depends(get_device_service)
 ):
-    """Deletes a specific device."""
-    return await device_service.delete_device(environment_id, device_id)
+    """Update a device."""
+    return await service.update(environment_id, device_id, data)
 
-# --- Relationship API Endpoints ---
-@relationship_router.post("", response_model=RelationshipModel, status_code=status.HTTP_201_CREATED)
-async def create_relationship_api(
-    environment_id: str,
-    rel_data: RelationshipCreateRequest,
-    relationship_service: RelationshipService = Depends(get_relationship_service)
+@app.delete("/environments/{environment_id}/devices/{device_id}", response_model=OperationResponse, tags=["Devices"])
+async def delete_device(
+    environment_id: str = Path(..., description="Environment identifier"),
+    device_id: str = Path(..., description="Device identifier"),
+    service: DeviceService = Depends(get_device_service)
 ):
-    """Creates a new relationship between two twins."""
-    return await relationship_service.create_relationship(environment_id, rel_data)
+    """Delete a device."""
+    return await service.delete(environment_id, device_id)
 
-@relationship_router.delete("")
-async def delete_relationship_api(
-    environment_id: str,
-    source_twin_id: str = Query(...),
-    target_twin_id: str = Query(...),
-    relationship_name: str = Query(...),
-    relationship_service: RelationshipService = Depends(get_relationship_service)
+# Relationship endpoints
+@app.post("/environments/{environment_id}/relationships", response_model=Relationship, status_code=status.HTTP_201_CREATED, tags=["Relationships"])
+async def create_relationship(
+    environment_id: str = Path(..., description="Environment identifier"),
+    data: RelationshipCreate = Body(...),
+    service: RelationshipService = Depends(get_relationship_service)
 ):
-    """Deletes a specific relationship between two twins."""
-    return await relationship_service.delete_relationship(environment_id, source_twin_id, target_twin_id, relationship_name)
+    """Create a new relationship between twins."""
+    return await service.create(environment_id, data)
 
-@relationship_router.get("", response_model=List[RelationshipModel])
-async def list_relationships_api(
-    environment_id: str,
-    twin_id: Optional[str] = Query(None),
-    relationship_service: RelationshipService = Depends(get_relationship_service)
+@app.get("/environments/{environment_id}/relationships", response_model=PaginatedResponse[Relationship], tags=["Relationships"])
+async def list_relationships(
+    environment_id: str = Path(..., description="Environment identifier"),
+    twin_id: Optional[str] = Query(None, description="Filter by twin ID"),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(settings.DEFAULT_PAGE_SIZE, ge=1, le=settings.MAX_PAGE_SIZE),
+    service: RelationshipService = Depends(get_relationship_service)
 ):
-    """Lists all relationships for an environment, optionally filtered by a specific twin."""
-    return await relationship_service.list_relationships(environment_id, twin_id)
+    """List relationships in an environment."""
+    return await service.list(environment_id, twin_id, skip, limit)
 
-# --- Telemetry API Endpoints ---
-@telemetry_router.post("", status_code=status.HTTP_204_NO_CONTENT)
-async def write_telemetry_api(
-    environment_id: str, # Not directly used by TelemetryService but good for context
-    telemetry_data: Telemetry,
-    telemetry_service: TelemetryService = Depends(get_telemetry_service)
+@app.get("/environments/{environment_id}/relationships/{source_twin_id}/{relationship_name}/{target_twin_id}", 
+         response_model=Relationship, tags=["Relationships"])
+async def get_relationship(
+    environment_id: str = Path(..., description="Environment identifier"),
+    source_twin_id: str = Path(..., description="Source twin identifier"),
+    relationship_name: str = Path(..., description="Relationship name"),
+    target_twin_id: str = Path(..., description="Target twin identifier"),
+    service: RelationshipService = Depends(get_relationship_service)
 ):
-    """Writes telemetry data."""
-    # Ensure environment_id is consistent
-    if telemetry_data.environment_id != environment_id:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Environment ID in payload must match path parameter.")
-    return await telemetry_service.write_telemetry(telemetry_data)
+    """Get a specific relationship."""
+    return await service.get(environment_id, source_twin_id, target_twin_id, relationship_name)
 
-@telemetry_router.get("", response_model=List[Dict[str, Any]])
-async def query_telemetry_api(
-    environment_id: str,
-    device_id: str = Query(...),
-    start_time: str = Query(..., description="Start time in RFC3339 format, e.g., '2023-01-01T00:00:00Z' or '-1h'"),
-    end_time: Optional[str] = Query(None, description="End time in RFC3339 format, e.g., '2023-01-01T01:00:00Z' or 'now()'"),
-    field: Optional[str] = Query(None, description="Specific telemetry field to query"),
-    telemetry_service: TelemetryService = Depends(get_telemetry_service)
+@app.delete("/environments/{environment_id}/relationships/{source_twin_id}/{relationship_name}/{target_twin_id}", 
+            response_model=OperationResponse, tags=["Relationships"])
+async def delete_relationship(
+    environment_id: str = Path(..., description="Environment identifier"),
+    source_twin_id: str = Path(..., description="Source twin identifier"),
+    relationship_name: str = Path(..., description="Relationship name"),
+    target_twin_id: str = Path(..., description="Target twin identifier"),
+    service: RelationshipService = Depends(get_relationship_service)
 ):
-    """Queries telemetry data."""
-    return await telemetry_service.query_telemetry(environment_id, device_id, start_time, end_time, field)
+    """Delete a relationship."""
+    return await service.delete(environment_id, source_twin_id, target_twin_id, relationship_name)
 
-# --- Workflow API Endpoints ---
-@workflow_router.post("", status_code=status.HTTP_201_CREATED)
-async def upload_workflow_api(
-    environment_id: str,
-    request: Request, # Keep Request for accessing app.state
-    workflow_id: str = Form(...),
-    file: UploadFile = File(...)
+# Workflow endpoints
+@app.post("/environments/{environment_id}/workflows", response_model=Workflow, status_code=status.HTTP_201_CREATED, tags=["Workflows"])
+async def create_workflow(
+    environment_id: str = Path(..., description="Environment identifier"),
+    data: WorkflowCreate = Body(...),
+    service: WorkflowService = Depends(get_workflow_service)
 ):
-    """Uploads a new workflow definition (YAML)."""
-    # Assuming WorkflowService only needs db
-    workflow_service = WorkflowService(request.app.state.clients.mongo["digital_twin_db"])
+    """Create a new workflow."""
+    return await service.create(environment_id, data)
+
+@app.post("/environments/{environment_id}/workflows/upload", response_model=Workflow, status_code=status.HTTP_201_CREATED, tags=["Workflows"])
+async def upload_workflow(
+    environment_id: str = Path(..., description="Environment identifier"),
+    workflow_id: str = Form(..., description="Workflow identifier"),
+    file: UploadFile = File(..., description="YAML workflow file"),
+    service: WorkflowService = Depends(get_workflow_service)
+):
+    """Upload a workflow from a YAML file."""
     content = await file.read()
-    return await workflow_service.upload_workflow(environment_id, workflow_id, file.filename, content)
+    return await service.upload(environment_id, workflow_id, file.filename, content)
 
-@workflow_router.delete("/{workflow_id}", status_code=status.HTTP_200_OK)
-async def delete_workflow_api(environment_id: str, workflow_id: str, request: Request):
-    """Deletes a specific workflow."""
-    # Assuming WorkflowService only needs db
-    workflow_service = WorkflowService(request.app.state.clients.mongo["digital_twin_db"])
-    return await workflow_service.delete_workflow(environment_id, workflow_id)
+@app.get("/environments/{environment_id}/workflows", response_model=PaginatedResponse[WorkflowSummary], tags=["Workflows"])
+async def list_workflows(
+    environment_id: str = Path(..., description="Environment identifier"),
+    status: Optional[WorkflowStatus] = Query(None, description="Filter by status"),
+    workflow_type: Optional[WorkflowType] = Query(None, description="Filter by type"),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(settings.DEFAULT_PAGE_SIZE, ge=1, le=settings.MAX_PAGE_SIZE),
+    service: WorkflowService = Depends(get_workflow_service)
+):
+    """List workflows in an environment."""
+    return await service.list(environment_id, status, workflow_type, skip, limit)
 
-@workflow_router.get("", response_model=WorkflowListResponse)
-async def list_workflows_api(environment_id: str, request: Request):
-    """Lists all workflows for a given environment."""
-    # Assuming WorkflowService only needs db
-    workflow_service = WorkflowService(request.app.state.clients.mongo["digital_twin_db"])
-    return await workflow_service.list_workflows(environment_id)
+@app.get("/environments/{environment_id}/workflows/{workflow_id}", response_model=Workflow, tags=["Workflows"])
+async def get_workflow(
+    environment_id: str = Path(..., description="Environment identifier"),
+    workflow_id: str = Path(..., description="Workflow identifier"),
+    service: WorkflowService = Depends(get_workflow_service)
+):
+    """Get a specific workflow with full content."""
+    return await service.get(environment_id, workflow_id)
 
-@workflow_router.get("/{workflow_id}", response_model=WorkflowViewResponse)
-async def view_workflow_api(environment_id: str, workflow_id: str, request: Request):
-    """Retrieves the content of a specific workflow."""
-    # Assuming WorkflowService only needs db
-    workflow_service = WorkflowService(request.app.state.clients.mongo["digital_twin_db"])
-    return await workflow_service.view_workflow(environment_id, workflow_id)
+@app.put("/environments/{environment_id}/workflows/{workflow_id}", response_model=Workflow, tags=["Workflows"])
+async def update_workflow(
+    environment_id: str = Path(..., description="Environment identifier"),
+    workflow_id: str = Path(..., description="Workflow identifier"),
+    data: WorkflowUpdate = Body(...),
+    service: WorkflowService = Depends(get_workflow_service)
+):
+    """Update a workflow."""
+    return await service.update(environment_id, workflow_id, data)
 
+@app.delete("/environments/{environment_id}/workflows/{workflow_id}", response_model=OperationResponse, tags=["Workflows"])
+async def delete_workflow(
+    environment_id: str = Path(..., description="Environment identifier"),
+    workflow_id: str = Path(..., description="Workflow identifier"),
+    service: WorkflowService = Depends(get_workflow_service)
+):
+    """Delete a workflow."""
+    return await service.delete(environment_id, workflow_id)
 
-# 子路由（只添加环境ID部分）
-app.include_router(environment_router, prefix="/environments", tags=["Environments"])
-app.include_router(model_router, prefix="/{environment_id}/models", tags=["Models"])
-app.include_router(twin_router, prefix="/{environment_id}/twins", tags=["Twins"])
-app.include_router(device_router, prefix="/{environment_id}/devices", tags=["Devices"])
-app.include_router(relationship_router, prefix="/{environment_id}/relationships", tags=["Relationships"])
-app.include_router(telemetry_router, prefix="/{environment_id}/telemetry", tags=["Telemetry"])
-app.include_router(workflow_router, prefix="/{environment_id}/workflows", tags=["Workflows"])
+@app.post("/environments/{environment_id}/workflows/{workflow_id}/activate", response_model=Workflow, tags=["Workflows"])
+async def activate_workflow(
+    environment_id: str = Path(..., description="Environment identifier"),
+    workflow_id: str = Path(..., description="Workflow identifier"),
+    service: WorkflowService = Depends(get_workflow_service)
+):
+    """Activate a workflow."""
+    return await service.activate(environment_id, workflow_id)
+
+@app.post("/environments/{environment_id}/workflows/{workflow_id}/deactivate", response_model=Workflow, tags=["Workflows"])
+async def deactivate_workflow(
+    environment_id: str = Path(..., description="Environment identifier"),
+    workflow_id: str = Path(..., description="Workflow identifier"),
+    service: WorkflowService = Depends(get_workflow_service)
+):
+    """Deactivate a workflow."""
+    return await service.deactivate(environment_id, workflow_id)
+
+# Health check endpoint
+@app.get("/health", tags=["Health"])
+async def health_check():
+    """Check application health."""
+    return {
+        "status": "healthy",
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "version": settings.API_VERSION
+    }
+
+# Root endpoint
+@app.get("/", tags=["General"])
+async def root():
+    """API root endpoint."""
+    return {
+        "title": settings.API_TITLE,
+        "version": settings.API_VERSION,
+        "docs": "/docs",
+        "health": "/health"
+    }

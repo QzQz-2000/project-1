@@ -1,148 +1,384 @@
 import pandas as pd
 import numpy as np
 from scipy.signal import butter, filtfilt
-import logging
 from abc import ABC, abstractmethod
-from typing import Dict, Any, Type, List, Optional, Union
-import joblib # For loading models, you might use others like tensorflow, torch
+from typing import Dict, Any, Type, List, Optional, Union, Callable, Tuple
+import joblib
 from sklearn.linear_model import LinearRegression
-import jsonschema # Import for JSON Schema validation
+import jsonschema
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+import asyncio
+from functools import lru_cache, wraps
+import warnings
+import yaml
+import hashlib
+import json
+from enum import Enum
+import inspect
 
-# --- Setup Logging ---
-# It's good practice to set up basic logging at the application's entry point.
-# Set default level to INFO for production, DEBUG for development.
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+# 导入统一的配置和模型
+from config import settings, setup_logging
+from models import FunctionCategory, FunctionMetadata, ValidationResult, ExecutionMode
 
-# --- Abstract Base Class for Functions ---
+# 设置日志
+logger = setup_logging()
+
 class BaseFunction(ABC):
-    """
-    Abstract base class for all platform functions.
-    Ensures all concrete functions adhere to a common interface.
-    """
-    name: str = "UnnamedFunction"
-    description: str = "No description provided."
-    # Enhanced JSON Schema default structure
+    """增强版基础函数类"""
+    # 类属性定义
+    metadata: FunctionMetadata = None
     config_schema: Dict[str, Any] = {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "title": "Function Configuration",
         "type": "object",
         "properties": {},
-        "additionalProperties": False # By default, disallow additional properties for stricter validation
+        "additionalProperties": False
     }
-
+    
+    # 性能相关配置
+    supports_parallel: bool = False
+    chunk_size: int = 10000
+    
+    # 缓存配置
+    cache_enabled: bool = False
+    cache_ttl: int = 3600
+    
     def __init__(self):
-        """Initializes a logger for each function instance."""
-        self.logger = logging.getLogger(self.__class__.__name__)
+        """初始化函数实例"""
+        self.logger = logger.getChild(self.__class__.__name__)
+        self._cache = {}
+        self._execution_stats = {
+            "total_runs": 0,
+            "total_errors": 0,
+            "avg_execution_time": 0,
+            "last_run": None
+        }
+        
+        # 验证必需的元数据
+        if not self.metadata:
+            raise ValueError(f"Function {self.__class__.__name__} must define metadata")
 
     @abstractmethod
     def run(self, data: pd.DataFrame, config: Dict[str, Any]) -> pd.DataFrame:
-        """
-        Executes the core logic of the function.
-        Functions should aim to return a *new* DataFrame, or a copy of the input
-        DataFrame with modifications, to avoid unintended side effects on the
-        original DataFrame passed into `run_function`.
-        
-        :param data: Input Pandas DataFrame.
-        :param config: Configuration parameters for the function.
-        :return: Processed Pandas DataFrame.
-        """
+        """执行核心逻辑"""
         pass
 
+    def validate_input(self, data: pd.DataFrame, config: Dict[str, Any]) -> ValidationResult:
+        """验证输入数据和配置"""
+        result = ValidationResult(is_valid=True)
+        
+        # 验证数据
+        if data.empty:
+            result.warnings.append("Input DataFrame is empty")
+        
+        # 验证配置
+        try:
+            jsonschema.validate(instance=config, schema=self.config_schema)
+        except jsonschema.ValidationError as e:
+            result.is_valid = False
+            error_path = ".".join(map(str, e.path)) if e.path else "root"
+            result.errors.append(f"Config validation failed: {e.message} at '{error_path}'")
+        
+        return result
+
+    def execute(self, data: pd.DataFrame, config: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+        """执行函数的包装方法，包含验证、缓存、统计等"""
+        import time
+        start_time = time.time()
+        
+        # 更新执行统计
+        self._execution_stats["total_runs"] += 1
+        self._execution_stats["last_run"] = datetime.now()
+        
+        try:
+            # 输入验证
+            validation_result = self.validate_input(data, config)
+            if not validation_result.is_valid:
+                raise ValueError(f"Validation failed: {'; '.join(validation_result.errors)}")
+            
+            # 缓存检查
+            if self.cache_enabled:
+                cache_key = self._generate_cache_key(data, config)
+                if cache_key in self._cache:
+                    cached_result, cached_time = self._cache[cache_key]
+                    if time.time() - cached_time < self.cache_ttl:
+                        self.logger.debug(f"Returning cached result for {self.metadata.name}")
+                        return cached_result, {"cached": True, "execution_time": 0}
+            
+            # 执行函数
+            if self.supports_parallel and len(data) > self.chunk_size:
+                result = self._run_parallel(data, config)
+            else:
+                result = self.run(data.copy(), config)
+            
+            # 更新缓存
+            if self.cache_enabled:
+                self._cache[cache_key] = (result, time.time())
+            
+            # 计算执行时间
+            execution_time = time.time() - start_time
+            self._update_avg_execution_time(execution_time)
+            
+            meta = {
+                "execution_time": execution_time,
+                "cached": False,
+                "warnings": validation_result.warnings,
+                "rows_processed": len(data),
+                "rows_output": len(result)
+            }
+            
+            return result, meta
+            
+        except Exception as e:
+            self._execution_stats["total_errors"] += 1
+            self.logger.error(f"Error executing {self.metadata.name}: {e}", exc_info=True)
+            raise
+
+    def _run_parallel(self, data: pd.DataFrame, config: Dict[str, Any]) -> pd.DataFrame:
+        """并行执行处理"""
+        chunks = np.array_split(data, max(1, len(data) // self.chunk_size))
+        
+        with ThreadPoolExecutor() as executor:
+            futures = [executor.submit(self.run, chunk.copy(), config) for chunk in chunks]
+            results = [future.result() for future in futures]
+        
+        return pd.concat(results, ignore_index=True)
+
+    def _generate_cache_key(self, data: pd.DataFrame, config: Dict[str, Any]) -> str:
+        """生成缓存键"""
+        # 使用数据的形状、列名和配置生成唯一键
+        data_repr = f"{data.shape}_{list(data.columns)}_{data.index[0] if not data.empty else ''}"
+        config_repr = json.dumps(config, sort_keys=True)
+        return hashlib.md5(f"{data_repr}_{config_repr}".encode()).hexdigest()
+
+    def _update_avg_execution_time(self, new_time: float):
+        """更新平均执行时间"""
+        n = self._execution_stats["total_runs"]
+        old_avg = self._execution_stats["avg_execution_time"]
+        self._execution_stats["avg_execution_time"] = (old_avg * (n - 1) + new_time) / n
+
+    def get_stats(self) -> Dict[str, Any]:
+        """获取执行统计信息"""
+        return self._execution_stats.copy()
+
+    # 辅助方法
     def _validate_columns(self, data: pd.DataFrame, required_columns: List[str]):
-        """
-        Helper method to validate if the DataFrame contains all required columns.
-        """
+        """验证必需的列"""
         missing_cols = [col for col in required_columns if col not in data.columns]
         if missing_cols:
-            raise ValueError(f"Function '{self.name}' requires columns: {', '.join(missing_cols)}.")
+            raise ValueError(f"Function '{self.metadata.name}' requires columns: {', '.join(missing_cols)}.")
 
     def _validate_numeric_column(self, data: pd.DataFrame, field: str):
-        """
-        Helper method to validate if a specified column is numeric.
-        """
+        """验证数值列"""
         if not pd.api.types.is_numeric_dtype(data[field]):
-            raise TypeError(f"Function '{self.name}' requires numeric data in column '{field}', but found non-numeric type.")
+            raise TypeError(f"Function '{self.metadata.name}' requires numeric data in column '{field}'.")
 
 
-# --- Function Registry and Decorator ---
-FUNCTION_REGISTRY: Dict[str, Type[BaseFunction]] = {}
-
-def register_function(cls: Type[BaseFunction]):
-    """
-    Decorator to register function classes into the global registry.
-    Ensures the class inherits from BaseFunction and has a valid name.
-    """
-    if not issubclass(cls, BaseFunction):
-        raise TypeError(f"Function class {cls.__name__} must inherit from BaseFunction.")
-    if not hasattr(cls, 'name') or not isinstance(cls.name, str) or not cls.name:
-        raise AttributeError(f"Function class {cls.__name__} must define a non-empty 'name' attribute.")
+class FunctionRegistry:
+    """增强版函数注册表"""
     
-    if cls.name in FUNCTION_REGISTRY:
-        raise ValueError(f"Function with name '{cls.name}' already registered by class {FUNCTION_REGISTRY[cls.name].__name__}. Current class: {cls.__name__}")
+    def __init__(self):
+        self._functions: Dict[str, Type[BaseFunction]] = {}
+        self._categories: Dict[FunctionCategory, List[str]] = {cat: [] for cat in FunctionCategory}
+        self._tags: Dict[str, List[str]] = {}
+        
+    def register(self, cls: Type[BaseFunction]) -> Type[BaseFunction]:
+        """注册函数"""
+        if not issubclass(cls, BaseFunction):
+            raise TypeError(f"Function class {cls.__name__} must inherit from BaseFunction.")
+        
+        if not cls.metadata:
+            raise ValueError(f"Function class {cls.__name__} must define metadata.")
+        
+        name = cls.metadata.name
+        if name in self._functions:
+            raise ValueError(f"Function '{name}' already registered.")
+        
+        self._functions[name] = cls
+        self._categories[cls.metadata.category].append(name)
+        
+        # 索引标签
+        for tag in cls.metadata.tags:
+            if tag not in self._tags:
+                self._tags[tag] = []
+            self._tags[tag].append(name)
+        
+        logger.debug(f"Registered function: {name} ({cls.__name__})")
+        return cls
     
-    FUNCTION_REGISTRY[cls.name] = cls
-    logging.debug(f"Registered function: {cls.name} ({cls.__name__})")
-    return cls
+    def get(self, name: str) -> Optional[Type[BaseFunction]]:
+        """获取函数类"""
+        return self._functions.get(name)
+    
+    def get_by_category(self, category: FunctionCategory) -> List[str]:
+        """按类别获取函数"""
+        return self._categories.get(category, [])
+    
+    def get_by_tag(self, tag: str) -> List[str]:
+        """按标签获取函数"""
+        return self._tags.get(tag, [])
+    
+    def search(self, 
+               query: str = None,
+               category: FunctionCategory = None,
+               tags: List[str] = None) -> List[Dict[str, Any]]:
+        """搜索函数"""
+        results = []
+        
+        for name, cls in self._functions.items():
+            meta = cls.metadata
+            
+            # 类别过滤
+            if category and meta.category != category:
+                continue
+            
+            # 标签过滤
+            if tags and not any(tag in meta.tags for tag in tags):
+                continue
+            
+            # 关键词搜索
+            if query:
+                query_lower = query.lower()
+                if not (query_lower in meta.name.lower() or 
+                        query_lower in meta.description.lower() or
+                        any(query_lower in tag.lower() for tag in meta.tags)):
+                    continue
+            
+            results.append({
+                "name": meta.name,
+                "description": meta.description,
+                "category": meta.category.value,
+                "version": meta.version,
+                "tags": meta.tags,
+                "config_schema": cls.config_schema
+            })
+        
+        return results
+    
+    def get_all_metadata(self) -> List[Dict[str, Any]]:
+        """获取所有函数元数据"""
+        return self.search()
+
+# 全局注册表实例
+REGISTRY = FunctionRegistry()
+
+# 装饰器
+def register_function(cls: Type[BaseFunction]) -> Type[BaseFunction]:
+    """函数注册装饰器"""
+    return REGISTRY.register(cls)
 
 # --- Data Transformation Functions ---
 
 @register_function
 class MovingAverageFunction(BaseFunction):
-    name = "MovingAverage"
-    description = "计算滑动平均值"
+    metadata = FunctionMetadata(
+        name="MovingAverage",
+        description="计算滑动平均值",
+        category=FunctionCategory.TRANSFORM,
+        tags=["smoothing", "time-series", "statistics"],
+        version="2.0.0"
+    )
+    
     config_schema = {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "title": "MovingAverage Configuration",
         "type": "object",
         "properties": {
-            "window": {"type": "integer", "default": 5, "description": "滑动窗口大小", "minimum": 1},
+            "window": {"type": "integer", "default": 5, "minimum": 1, "description": "滑动窗口大小"},
             "field": {"type": "string", "default": "value", "description": "要应用滑动平均的列名"},
-            "drop_na_rows": {"type": "boolean", "default": True, "description": "是否删除因滑动窗口导致的NaN行"}
+            "method": {"type": "string", "enum": ["simple", "exponential", "weighted"], "default": "simple"},
+            "alpha": {"type": "number", "minimum": 0, "maximum": 1, "default": 0.3, "description": "指数平滑系数"},
+            "weights": {"type": "array", "items": {"type": "number"}, "description": "加权平均的权重"},
+            "center": {"type": "boolean", "default": False, "description": "是否居中对齐窗口"},
+            "min_periods": {"type": "integer", "minimum": 1, "description": "最小观测数"},
+            "drop_na_rows": {"type": "boolean", "default": True, "description": "是否删除NaN行"}
         },
         "required": ["field"],
         "additionalProperties": False
     }
+    
+    supports_parallel = True
+    cache_enabled = True
 
-    def run(self, data: pd.DataFrame, config: dict) -> pd.DataFrame:
+    def run(self, data: pd.DataFrame, config: Dict[str, Any]) -> pd.DataFrame:
+        field = config["field"]
         window = config.get("window", 5)
-        field = config.get("field", "value")
-        drop_na_rows = config.get("drop_na_rows", True)
-
-        self._validate_columns(data, [field]) # Validate input column
+        method = config.get("method", "simple")
+        drop_na = config.get("drop_na_rows", True)
+        
+        self._validate_columns(data, [field])
         self._validate_numeric_column(data, field)
-
+        
         if data[field].empty:
-            self.logger.warning(f"Field '{field}' in DataFrame is empty. Cannot apply MovingAverage. Returning original data.")
+            self.logger.warning(f"Field '{field}' is empty. Returning original data.")
             return data.copy()
-
-        processed_data = data.copy() # Work on a copy
-        # Create a new column for the result
-        new_column_name = f"{field}_ma{window}"
-        processed_data[new_column_name] = processed_data[field].rolling(window=window).mean()
         
-        if drop_na_rows:
-            original_rows = len(processed_data)
-            processed_data = processed_data.dropna(subset=[new_column_name])
-            dropped_rows = original_rows - len(processed_data)
-            self.logger.info(f"Applied MovingAverage to '{field}' with window {window}. New column: {new_column_name}. Dropped {dropped_rows} rows with NaN values.")
+        result = data.copy()
+        output_field = f"{field}_ma{window}"
+        
+        if method == "simple":
+            center = config.get("center", False)
+            min_periods = config.get("min_periods", 1)
+            result[output_field] = data[field].rolling(
+                window=window, 
+                center=center,
+                min_periods=min_periods
+            ).mean()
+            
+        elif method == "exponential":
+            alpha = config.get("alpha", 0.3)
+            result[output_field] = data[field].ewm(alpha=alpha, adjust=False).mean()
+            
+        elif method == "weighted":
+            weights = config.get("weights")
+            if not weights:
+                # 默认线性递增权重
+                weights = np.arange(1, window + 1)
+            else:
+                weights = np.array(weights[:window])
+            
+            def weighted_average(series):
+                return np.average(series, weights=weights)
+            
+            result[output_field] = data[field].rolling(window=window).apply(weighted_average, raw=True)
+        
+        if drop_na:
+            original_rows = len(result)
+            result = result.dropna(subset=[output_field])
+            dropped_rows = original_rows - len(result)
+            self.logger.info(f"Applied {method} moving average to '{field}'. Dropped {dropped_rows} NaN rows.")
         else:
-            self.logger.info(f"Applied MovingAverage to '{field}' with window {window}. New column: {new_column_name}. NaN rows kept.")
+            self.logger.info(f"Applied {method} moving average to '{field}'. NaN rows kept.")
         
-        return processed_data
+        return result
 
 @register_function
 class FillNaFunction(BaseFunction):
-    name = "FillNA"
-    description = "填充缺失值"
+    metadata = FunctionMetadata(
+        name="FillNA",
+        description="填充缺失值",
+        category=FunctionCategory.TRANSFORM,
+        tags=["preprocessing", "missing-data", "cleaning"]
+    )
+    
     config_schema = {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "title": "FillNA Configuration",
         "type": "object",
         "properties": {
-            "method": {"type": "string", "default": "ffill", "enum": ["ffill", "bfill", "mean", "value"], "description": "填充方法"},
+            "method": {
+                "type": "string", 
+                "default": "ffill", 
+                "enum": ["ffill", "bfill", "mean", "median", "mode", "value", "interpolate"], 
+                "description": "填充方法"
+            },
             "field": {"type": "string", "default": "value", "description": "要填充的列名"},
-            # fill_value's type should be flexible, runtime check for compatibility
-            "fill_value": {"description": "当method为'value'时的填充值 (类型需与列兼容)"}
+            "fill_value": {"description": "当method为'value'时的填充值"},
+            "limit": {"type": "integer", "minimum": 1, "description": "连续填充的最大数量"},
+            "interpolation_method": {
+                "type": "string", 
+                "enum": ["linear", "polynomial", "spline"],
+                "default": "linear",
+                "description": "插值方法"
+            }
         },
         "required": ["field"],
         "additionalProperties": False
@@ -152,48 +388,67 @@ class FillNaFunction(BaseFunction):
         method = config.get("method", "ffill")
         field = config.get("field", "value")
         fill_value = config.get("fill_value")
+        limit = config.get("limit")
 
         self._validate_columns(data, [field])
 
-        processed_data = data.copy() # Work on a copy to avoid SettingWithCopyWarning
+        processed_data = data.copy()
         
         if processed_data[field].empty:
-            self.logger.warning(f"Field '{field}' in DataFrame is empty. No NA to fill. Returning original data.")
+            self.logger.warning(f"Field '{field}' is empty. No NA to fill.")
             return processed_data
 
         if method == "mean":
-            self._validate_numeric_column(processed_data, field) # Ensure numeric for mean
+            self._validate_numeric_column(processed_data, field)
             processed_data[field] = processed_data[field].fillna(processed_data[field].mean())
-            self.logger.info(f"Filled NA in '{field}' using mean method.")
+        elif method == "median":
+            self._validate_numeric_column(processed_data, field)
+            processed_data[field] = processed_data[field].fillna(processed_data[field].median())
+        elif method == "mode":
+            mode_value = processed_data[field].mode()
+            if not mode_value.empty:
+                processed_data[field] = processed_data[field].fillna(mode_value[0])
         elif method == "value":
             if fill_value is None:
-                self.logger.warning(f"Method is 'value' but 'fill_value' is not provided for field '{field}'. Skipping fill.")
+                self.logger.warning(f"Method is 'value' but 'fill_value' not provided.")
             else:
-                # Basic type compatibility check for fill_value and column dtype
-                if pd.isna(processed_data[field]).all(): # If all are NA, dtype might be object, allow fill
-                    processed_data[field] = processed_data[field].fillna(fill_value)
-                elif not isinstance(fill_value, (int, float)) and pd.api.types.is_numeric_dtype(processed_data[field]):
-                    self.logger.warning(f"Fill value '{fill_value}' type might not be compatible with numeric field '{field}'. Attempting fill anyway.")
-                    processed_data[field] = processed_data[field].fillna(fill_value)
-                else:
-                    processed_data[field] = processed_data[field].fillna(fill_value)
-                self.logger.info(f"Filled NA in '{field}' with specific value '{fill_value}'.")
-        else: # ffill or bfill
-            processed_data[field] = processed_data[field].fillna(method=method)
-            self.logger.info(f"Filled NA in '{field}' using '{method}' method.")
+                processed_data[field] = processed_data[field].fillna(fill_value)
+        elif method == "interpolate":
+            interp_method = config.get("interpolation_method", "linear")
+            processed_data[field] = processed_data[field].interpolate(method=interp_method, limit=limit)
+        else:  # ffill or bfill
+            processed_data[field] = processed_data[field].fillna(method=method, limit=limit)
+        
+        self.logger.info(f"Filled NA in '{field}' using '{method}' method.")
         return processed_data
 
 @register_function
 class NormalizeFunction(BaseFunction):
-    name = "Normalize"
-    description = "将指定列的值归一化到 [0, 1]"
+    metadata = FunctionMetadata(
+        name="Normalize",
+        description="数据归一化",
+        category=FunctionCategory.TRANSFORM,
+        tags=["preprocessing", "scaling", "normalization"]
+    )
+    
     config_schema = {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "title": "Normalize Configuration",
         "type": "object",
         "properties": {
             "field": {"type": "string", "default": "value", "description": "要归一化的列名"},
-            "output_field": {"type": "string", "description": "归一化后结果的新列名 (默认为原列名_norm)"}
+            "method": {
+                "type": "string",
+                "enum": ["minmax", "zscore", "robust", "maxabs"],
+                "default": "minmax",
+                "description": "归一化方法"
+            },
+            "feature_range": {
+                "type": "array",
+                "items": {"type": "number"},
+                "default": [0, 1],
+                "description": "MinMax归一化的目标范围"
+            },
+            "output_field": {"type": "string", "description": "归一化后结果的新列名"}
         },
         "required": ["field"],
         "additionalProperties": False
@@ -201,37 +456,77 @@ class NormalizeFunction(BaseFunction):
 
     def run(self, data: pd.DataFrame, config: Dict[str, Any]) -> pd.DataFrame:
         field = config.get("field", "value")
+        method = config.get("method", "minmax")
         output_field = config.get("output_field", f"{field}_norm")
 
         self._validate_columns(data, [field])
         self._validate_numeric_column(data, field)
 
         processed_data = data.copy()
-        min_val = processed_data[field].min()
-        max_val = processed_data[field].max()
-
-        if max_val == min_val:
-            self.logger.warning(f"Min and max values are the same for '{field}'. Normalized value will be 0.0.")
-            processed_data[output_field] = 0.0
-        else:
-            processed_data[output_field] = (processed_data[field] - min_val) / (max_val - min_val)
         
-        self.logger.info(f"Normalized field '{field}' to '{output_field}'.")
+        if method == "minmax":
+            feature_range = config.get("feature_range", [0, 1])
+            min_val = processed_data[field].min()
+            max_val = processed_data[field].max()
+            
+            if max_val == min_val:
+                self.logger.warning(f"Min and max values are the same for '{field}'. Setting to range minimum.")
+                processed_data[output_field] = feature_range[0]
+            else:
+                processed_data[output_field] = (processed_data[field] - min_val) / (max_val - min_val)
+                processed_data[output_field] = processed_data[output_field] * (feature_range[1] - feature_range[0]) + feature_range[0]
+                
+        elif method == "zscore":
+            mean_val = processed_data[field].mean()
+            std_val = processed_data[field].std()
+            
+            if std_val == 0:
+                self.logger.warning(f"Standard deviation is zero for '{field}'. Setting normalized values to 0.")
+                processed_data[output_field] = 0.0
+            else:
+                processed_data[output_field] = (processed_data[field] - mean_val) / std_val
+                
+        elif method == "robust":
+            median_val = processed_data[field].median()
+            q1 = processed_data[field].quantile(0.25)
+            q3 = processed_data[field].quantile(0.75)
+            iqr = q3 - q1
+            
+            if iqr == 0:
+                self.logger.warning(f"IQR is zero for '{field}'. Setting normalized values to 0.")
+                processed_data[output_field] = 0.0
+            else:
+                processed_data[output_field] = (processed_data[field] - median_val) / iqr
+                
+        elif method == "maxabs":
+            max_abs = processed_data[field].abs().max()
+            if max_abs == 0:
+                self.logger.warning(f"Max absolute value is zero for '{field}'. Setting normalized values to 0.")
+                processed_data[output_field] = 0.0
+            else:
+                processed_data[output_field] = processed_data[field] / max_abs
+        
+        self.logger.info(f"Normalized field '{field}' using '{method}' method to '{output_field}'.")
         return processed_data
 
 @register_function
 class DifferencingFunction(BaseFunction):
-    name = "Differencing"
-    description = "计算一阶差分，常用于平稳化时间序列"
+    metadata = FunctionMetadata(
+        name="Differencing",
+        description="计算差分，常用于平稳化时间序列",
+        category=FunctionCategory.TRANSFORM,
+        tags=["time-series", "stationarity", "preprocessing"]
+    )
+    
     config_schema = {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "title": "Differencing Configuration",
         "type": "object",
         "properties": {
             "field": {"type": "string", "default": "value", "description": "要计算差分的列名"},
             "periods": {"type": "integer", "default": 1, "description": "差分周期", "minimum": 1},
-            "output_field": {"type": "string", "description": "差分结果的新列名 (默认为原列名_diff)"},
-            "drop_na_rows": {"type": "boolean", "default": True, "description": "是否删除因差分导致的NaN行"}
+            "order": {"type": "integer", "default": 1, "description": "差分阶数", "minimum": 1},
+            "output_field": {"type": "string", "description": "差分结果的新列名"},
+            "drop_na_rows": {"type": "boolean", "default": True, "description": "是否删除NaN行"}
         },
         "required": ["field"],
         "additionalProperties": False
@@ -240,36 +535,51 @@ class DifferencingFunction(BaseFunction):
     def run(self, data: pd.DataFrame, config: Dict[str, Any]) -> pd.DataFrame:
         field = config.get("field", "value")
         periods = config.get("periods", 1)
-        output_field = config.get("output_field", f"{field}_diff")
+        order = config.get("order", 1)
+        output_field = config.get("output_field", f"{field}_diff{order}")
         drop_na_rows = config.get("drop_na_rows", True)
 
         self._validate_columns(data, [field])
         self._validate_numeric_column(data, field)
 
         processed_data = data.copy()
-        processed_data[output_field] = processed_data[field].diff(periods=periods)
+        
+        # 执行多阶差分
+        diff_result = processed_data[field]
+        for _ in range(order):
+            diff_result = diff_result.diff(periods=periods)
+        
+        processed_data[output_field] = diff_result
         
         if drop_na_rows:
             original_rows = len(processed_data)
             processed_data = processed_data.dropna(subset=[output_field])
             dropped_rows = original_rows - len(processed_data)
-            self.logger.info(f"Applied {periods}-period differencing to '{field}'. New column: {output_field}. Dropped {dropped_rows} rows with NaN values.")
+            self.logger.info(f"Applied {order}-order differencing with period {periods} to '{field}'. Dropped {dropped_rows} NaN rows.")
         else:
-            self.logger.info(f"Applied {periods}-period differencing to '{field}'. New column: {output_field}. NaN rows kept.")
+            self.logger.info(f"Applied {order}-order differencing with period {periods} to '{field}'. NaN rows kept.")
+            
         return processed_data
+
+# --- Statistical Functions ---
 
 @register_function
 class StdDeviationFunction(BaseFunction):
-    name = "StdDeviation"
-    description = "计算滑动标准差"
+    metadata = FunctionMetadata(
+        name="StdDeviation",
+        description="计算滑动标准差",
+        category=FunctionCategory.ANALYSIS,
+        tags=["statistics", "volatility", "time-series"]
+    )
+    
     config_schema = {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "title": "StdDeviation Configuration",
         "type": "object",
         "properties": {
             "window": {"type": "integer", "default": 5, "description": "滑动窗口大小", "minimum": 1},
             "field": {"type": "string", "default": "value", "description": "要计算标准差的列名"},
-            "output_field": {"type": "string", "description": "标准差结果的新列名 (默认为原列名_std)"}
+            "output_field": {"type": "string", "description": "标准差结果的新列名"},
+            "ddof": {"type": "integer", "default": 1, "description": "自由度调整", "minimum": 0}
         },
         "required": ["field"],
         "additionalProperties": False
@@ -278,27 +588,36 @@ class StdDeviationFunction(BaseFunction):
     def run(self, data: pd.DataFrame, config: Dict[str, Any]) -> pd.DataFrame:
         window = config.get("window", 5)
         field = config.get("field", "value")
-        output_field = config.get("output_field", f"{field}_std")
+        output_field = config.get("output_field", f"{field}_std{window}")
+        ddof = config.get("ddof", 1)
 
         self._validate_columns(data, [field])
         self._validate_numeric_column(data, field)
 
         processed_data = data.copy()
-        processed_data[output_field] = processed_data[field].rolling(window=window).std()
-        self.logger.info(f"Calculated rolling standard deviation for '{field}' with window {window}. New column: {output_field}")
-        return processed_data.dropna(subset=[output_field]) # Still drop NaN for std by default, as they are often invalid.
+        processed_data[output_field] = processed_data[field].rolling(window=window).std(ddof=ddof)
+        
+        self.logger.info(f"Calculated rolling standard deviation for '{field}' with window {window}.")
+        return processed_data
+
+# --- Anomaly Detection Functions ---
 
 @register_function
 class ZScoreFunction(BaseFunction):
-    name = "ZScore"
-    description = "标记z-score异常值"
+    metadata = FunctionMetadata(
+        name="ZScore",
+        description="Z-Score异常检测",
+        category=FunctionCategory.ANALYSIS,
+        tags=["anomaly-detection", "outlier", "statistics"]
+    )
+    
     config_schema = {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "title": "ZScore Configuration",
         "type": "object",
         "properties": {
             "field": {"type": "string", "default": "value", "description": "要计算Z-Score的列名"},
-            "threshold": {"type": "number", "default": 2.0, "description": "异常阈值 (绝对值)", "minimum": 0},
+            "threshold": {"type": "number", "default": 3.0, "description": "异常阈值", "minimum": 0},
+            "window": {"type": "integer", "description": "滑动窗口大小（可选）", "minimum": 1},
             "zscore_output_field": {"type": "string", "default": "zscore", "description": "Z-Score结果列名"},
             "anomaly_output_field": {"type": "string", "default": "is_anomaly", "description": "异常标记结果列名"}
         },
@@ -308,7 +627,8 @@ class ZScoreFunction(BaseFunction):
 
     def run(self, data: pd.DataFrame, config: Dict[str, Any]) -> pd.DataFrame:
         field = config.get("field", "value")
-        threshold = config.get("threshold", 2.0)
+        threshold = config.get("threshold", 3.0)
+        window = config.get("window")
         zscore_output_field = config.get("zscore_output_field", "zscore")
         anomaly_output_field = config.get("anomaly_output_field", "is_anomaly")
 
@@ -316,34 +636,127 @@ class ZScoreFunction(BaseFunction):
         self._validate_numeric_column(data, field)
 
         processed_data = data.copy()
-        mean_val = processed_data[field].mean()
-        std_val = processed_data[field].std()
-
-        if std_val == 0:
-            self.logger.warning(f"Standard deviation for '{field}' is zero. Z-scores will be zero. Cannot detect anomalies based on std deviation for this data range.")
-            processed_data[zscore_output_field] = 0.0
-            processed_data[anomaly_output_field] = False
-        else:
-            processed_data[zscore_output_field] = (processed_data[field] - mean_val) / std_val
-            processed_data[anomaly_output_field] = processed_data[zscore_output_field].abs() > threshold
         
-        self.logger.info(f"Calculated Z-Scores for '{field}' (threshold={threshold}).")
+        if window:
+            # 滑动窗口Z-Score
+            rolling = processed_data[field].rolling(window=window)
+            mean_val = rolling.mean()
+            std_val = rolling.std()
+        else:
+            # 全局Z-Score
+            mean_val = processed_data[field].mean()
+            std_val = processed_data[field].std()
+
+        if isinstance(std_val, pd.Series):
+            processed_data[zscore_output_field] = np.where(
+                std_val == 0, 0, (processed_data[field] - mean_val) / std_val
+            )
+        else:
+            if std_val == 0:
+                self.logger.warning(f"Standard deviation for '{field}' is zero. Z-scores will be zero.")
+                processed_data[zscore_output_field] = 0.0
+            else:
+                processed_data[zscore_output_field] = (processed_data[field] - mean_val) / std_val
+        
+        processed_data[anomaly_output_field] = processed_data[zscore_output_field].abs() > threshold
+        
+        anomaly_count = processed_data[anomaly_output_field].sum()
+        self.logger.info(f"Calculated Z-Scores for '{field}' (threshold={threshold}). Found {anomaly_count} anomalies.")
         return processed_data
 
-# --- Alarming Function ---
 @register_function
-class ThresholdAlarmFunction(BaseFunction):
-    name = "ThresholdAlarm"
-    description = "基于阈值判断触发告警标记"
+class IQRAnomalyFunction(BaseFunction):
+    metadata = FunctionMetadata(
+        name="IQRAnomaly",
+        description="基于四分位距(IQR)的异常检测",
+        category=FunctionCategory.ANALYSIS,
+        tags=["anomaly-detection", "outlier", "statistics", "robust"]
+    )
+    
     config_schema = {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "title": "ThresholdAlarm Configuration",
+        "type": "object",
+        "properties": {
+            "field": {"type": "string", "default": "value", "description": "要检测的列名"},
+            "k": {"type": "number", "default": 1.5, "description": "IQR倍数", "minimum": 0},
+            "lower_percentile": {"type": "number", "default": 25, "description": "下四分位数", "minimum": 0, "maximum": 50},
+            "upper_percentile": {"type": "number", "default": 75, "description": "上四分位数", "minimum": 50, "maximum": 100},
+            "score_output_field": {"type": "string", "default": "iqr_score", "description": "异常分数列名"},
+            "anomaly_output_field": {"type": "string", "default": "is_outlier", "description": "异常标记列名"}
+        },
+        "required": ["field"],
+        "additionalProperties": False
+    }
+
+    def run(self, data: pd.DataFrame, config: Dict[str, Any]) -> pd.DataFrame:
+        field = config.get("field", "value")
+        k = config.get("k", 1.5)
+        lower_pct = config.get("lower_percentile", 25) / 100
+        upper_pct = config.get("upper_percentile", 75) / 100
+        score_field = config.get("score_output_field", "iqr_score")
+        anomaly_field = config.get("anomaly_output_field", "is_outlier")
+
+        self._validate_columns(data, [field])
+        self._validate_numeric_column(data, field)
+
+        processed_data = data.copy()
+        
+        Q1 = processed_data[field].quantile(lower_pct)
+        Q3 = processed_data[field].quantile(upper_pct)
+        IQR = Q3 - Q1
+        
+        lower_bound = Q1 - k * IQR
+        upper_bound = Q3 + k * IQR
+        
+        # 计算异常分数（距离边界的相对距离）
+        processed_data[score_field] = np.maximum(
+            (lower_bound - processed_data[field]) / IQR,
+            (processed_data[field] - upper_bound) / IQR
+        )
+        processed_data[score_field] = processed_data[score_field].clip(lower=0)
+        
+        processed_data[anomaly_field] = (processed_data[field] < lower_bound) | (processed_data[field] > upper_bound)
+        
+        outlier_count = processed_data[anomaly_field].sum()
+        self.logger.info(f"IQR anomaly detection on '{field}' found {outlier_count} outliers (k={k}).")
+        
+        return processed_data
+
+# --- Alarm Functions ---
+
+@register_function
+class ThresholdAlarmFunction(BaseFunction):
+    metadata = FunctionMetadata(
+        name="ThresholdAlarm",
+        description="基于阈值的告警",
+        category=FunctionCategory.ALARM,
+        tags=["alarm", "monitoring", "threshold"]
+    )
+    
+    config_schema = {
+        "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
         "properties": {
             "field": {"type": "string", "default": "value", "description": "要检查的列名"},
             "threshold": {"type": "number", "default": 80, "description": "阈值"},
-            "mode": {"type": "string", "default": "greater", "enum": ["greater", "less", "equal", "not_equal", "greater_equal", "less_equal"], "description": "判断模式"},
-            "alarm_output_field": {"type": "string", "default": "is_alarm", "description": "告警标记结果列名"}
+            "mode": {
+                "type": "string", 
+                "default": "greater", 
+                "enum": ["greater", "less", "equal", "not_equal", "greater_equal", "less_equal", "between", "not_between"],
+                "description": "判断模式"
+            },
+            "lower_threshold": {"type": "number", "description": "下限阈值（用于between模式）"},
+            "upper_threshold": {"type": "number", "description": "上限阈值（用于between模式）"},
+            "alarm_output_field": {"type": "string", "default": "is_alarm", "description": "告警标记结果列名"},
+            "severity_field": {"type": "string", "description": "告警严重程度列名"},
+            "severity_levels": {
+                "type": "object",
+                "description": "告警严重程度配置",
+                "properties": {
+                    "warning": {"type": "number"},
+                    "critical": {"type": "number"}
+                }
+            }
         },
         "required": ["field", "threshold", "mode"],
         "additionalProperties": False
@@ -354,15 +767,18 @@ class ThresholdAlarmFunction(BaseFunction):
         threshold = config.get("threshold", 80)
         mode = config.get("mode", "greater")
         alarm_output_field = config.get("alarm_output_field", "is_alarm")
+        severity_field = config.get("severity_field")
+        severity_levels = config.get("severity_levels")
 
         self._validate_columns(data, [field])
-        processed_data = data.copy() # Work on a copy
+        processed_data = data.copy()
 
         if not pd.api.types.is_numeric_dtype(processed_data[field]):
-            self.logger.error(f"Field '{field}' is not numeric, cannot apply threshold alarm. Setting '{alarm_output_field}' to False.")
-            processed_data[alarm_output_field] = False # Add column with default value
+            self.logger.error(f"Field '{field}' is not numeric. Setting '{alarm_output_field}' to False.")
+            processed_data[alarm_output_field] = False
             return processed_data
 
+        # 基本阈值判断
         if mode == "greater":
             processed_data[alarm_output_field] = processed_data[field] > threshold
         elif mode == "less":
@@ -375,582 +791,68 @@ class ThresholdAlarmFunction(BaseFunction):
             processed_data[alarm_output_field] = processed_data[field] >= threshold
         elif mode == "less_equal":
             processed_data[alarm_output_field] = processed_data[field] <= threshold
-        else:
-            # This case should ideally be caught by JSON schema validation, but included for robustness
-            self.logger.error(f"Unsupported mode '{mode}' for ThresholdAlarm. Setting '{alarm_output_field}' to False.")
-            processed_data[alarm_output_field] = False
-            return processed_data
+        elif mode == "between":
+            lower = config.get("lower_threshold", threshold)
+            upper = config.get("upper_threshold", threshold)
+            processed_data[alarm_output_field] = processed_data[field].between(lower, upper)
+        elif mode == "not_between":
+            lower = config.get("lower_threshold", threshold)
+            upper = config.get("upper_threshold", threshold)
+            processed_data[alarm_output_field] = ~processed_data[field].between(lower, upper)
         
-        self.logger.info(f"Applied ThresholdAlarm to '{field}' (threshold={threshold}, mode='{mode}'). New column: {alarm_output_field}")
-        return processed_data
-
-# --- Aggregation Function ---
-@register_function
-class AggregatorFunction(BaseFunction):
-    name = "Aggregator"
-    description = "按时间粒度聚合数据"
-    config_schema = {
-        "$schema": "http://json-schema.org/draft-07/schema#",
-        "title": "Aggregator Configuration",
-        "type": "object",
-        "properties": {
-            "time_field": {"type": "string", "default": "time", "description": "时间列名"},
-            "value_field": {"type": "string", "default": "value", "description": "要聚合的数值列名"},
-            "interval": {"type": "string", "default": "1min", "description": "聚合时间粒度，例如 '1min', '1h', '1D'"},
-            "method": {"type": "string", "default": "mean", "enum": ["mean", "sum", "max", "min", "first", "last", "count", "median"], "description": "聚合方法"}, # Added count, median
-            "group_by_fields": {"type": "array", "items": {"type": "string"}, "description": "可选：按这些字段分组后聚合"}
-        },
-        "required": ["time_field", "value_field", "interval", "method"],
-        "additionalProperties": False
-    }
-
-    def run(self, data: pd.DataFrame, config: dict) -> pd.DataFrame:
-        time_field = config.get("time_field", "time")
-        value_field = config.get("value_field", "value")
-        interval = config.get("interval", "1min")
-        method = config.get("method", "mean")
-        group_by_fields = config.get("group_by_fields", [])
-
-        self._validate_columns(data, [time_field, value_field] + group_by_fields)
-
-        processed_data = data.copy()
-        
-        if processed_data.empty:
-            self.logger.warning("Input DataFrame is empty. Aggregation skipped. Returning empty DataFrame.")
-            return pd.DataFrame()
-
-        # Convert time_field to datetime only if it's not already
-        if not pd.api.types.is_datetime64_any_dtype(processed_data[time_field]):
-            try:
-                processed_data[time_field] = pd.to_datetime(processed_data[time_field])
-                self.logger.debug(f"Converted '{time_field}' to datetime type.")
-            except Exception as e:
-                self.logger.error(f"Failed to convert '{time_field}' to datetime type: {e}. Cannot perform aggregation. Returning original data.", exc_info=True)
-                return data.copy()
-
-        processed_data.set_index(time_field, inplace=True)
-        self._validate_numeric_column(processed_data, value_field) # Value field must be numeric for aggregation
-
-        if group_by_fields:
-            # Ensure group_by_fields are not in index if they are columns
-            if any(f in processed_data.index.names for f in group_by_fields):
-                self.logger.error(f"Cannot group by fields that are part of the index: {group_by_fields}. Returning original data.")
-                return data.copy() # Revert to original if invalid state
-
-            grouped = processed_data.groupby(group_by_fields).resample(interval)[value_field]
-        else:
-            grouped = processed_data.resample(interval)[value_field]
-
-        # Use getattr to call the specified aggregation method dynamically
-        if not hasattr(grouped, method):
-            self.logger.error(f"Aggregation method '{method}' not found for grouped data. Returning empty DataFrame.")
-            return pd.DataFrame()
+        # 告警严重程度
+        if severity_field and severity_levels:
+            processed_data[severity_field] = "normal"
             
-        aggregated_data = getattr(grouped, method)()
-
-        if group_by_fields:
-            aggregated_data = aggregated_data.reset_index()
-        else:
-            # For non-grouped aggregation, reset_index to make time_field a column again
-            aggregated_data = aggregated_data.to_frame().reset_index()
+            if "warning" in severity_levels:
+                warning_threshold = severity_levels["warning"]
+                if mode in ["greater", "greater_equal"]:
+                    processed_data.loc[processed_data[field] > warning_threshold, severity_field] = "warning"
+                elif mode in ["less", "less_equal"]:
+                    processed_data.loc[processed_data[field] < warning_threshold, severity_field] = "warning"
             
-        self.logger.info(f"Aggregated '{value_field}' by '{interval}' with '{method}' method. Grouped by: {group_by_fields}")
-        return aggregated_data.dropna() # Drop rows where aggregation might result in NA (e.g., empty intervals)
-
-# --- Storage Function ---
-@register_function
-class CSVExporterFunction(BaseFunction):
-    name = "CSVExporter"
-    description = "将数据导出为CSV文件"
-    config_schema = {
-        "$schema": "http://json-schema.org/draft-07/schema#",
-        "title": "CSVExporter Configuration",
-        "type": "object",
-        "properties": {
-            "file_path": {"type": "string", "default": "./output.csv", "description": "输出CSV文件的完整路径"},
-            "index": {"type": "boolean", "default": False, "description": "是否写入DataFrame索引"},
-            "encoding": {"type": "string", "default": "utf-8", "description": "CSV文件编码"},
-            "raise_on_error": {"type": "boolean", "default": False, "description": "导出失败时是否抛出异常"}
-        },
-        "additionalProperties": False
-    }
-
-    def run(self, data: pd.DataFrame, config: Dict[str, Any]) -> pd.DataFrame:
-        file_path = config.get("file_path", "./output.csv")
-        include_index = config.get("index", False)
-        encoding = config.get("encoding", "utf-8")
-        raise_on_error = config.get("raise_on_error", False)
-
-        try:
-            data.to_csv(file_path, index=include_index, encoding=encoding)
-            self.logger.info(f"Data successfully exported to {file_path}")
-        except Exception as e:
-            self.logger.error(f"Failed to export data to CSV at {file_path}: {e}", exc_info=True)
-            if raise_on_error:
-                raise # Re-raise the exception to stop the workflow
-        return data # Always return the data, even on error (if not re-raising), to allow workflow to continue
-
-# --- Fourier Transform Function ---
-@register_function
-class FourierTransformFunction(BaseFunction):
-    name = "FourierTransform"
-    description = "执行快速傅里叶变换（FFT）以分析频率成分"
-    config_schema = {
-        "$schema": "http://json-schema.org/draft-07/schema#",
-        "title": "FourierTransform Configuration",
-        "type": "object",
-        "properties": {
-            "field": {"type": "string", "default": "value", "description": "要进行FFT的数值列名"},
-            "output_frequency_field": {"type": "string", "default": "frequency", "description": "输出频率列名"},
-            "output_amplitude_field": {"type": "string", "default": "amplitude", "description": "输出振幅列名"}
-        },
-        "required": ["field"],
-        "additionalProperties": False
-    }
-
-    def run(self, data: pd.DataFrame, config: Dict[str, Any]) -> pd.DataFrame:
-        field = config.get("field", "value")
-        output_freq_field = config.get("output_frequency_field", "frequency")
-        output_amp_field = config.get("output_amplitude_field", "amplitude")
-
-        self._validate_columns(data, [field])
-        self._validate_numeric_column(data, field)
-
-        y = data[field].values
-        if len(y) == 0:
-            self.logger.warning(f"No data points in field '{field}' for Fourier Transform. Returning empty DataFrame.")
-            return pd.DataFrame(columns=[output_freq_field, output_amp_field]) # Return DataFrame with expected columns
-
-        fft_result = np.fft.fft(y)
-        frequencies = np.fft.fftfreq(len(y))
+            if "critical" in severity_levels:
+                critical_threshold = severity_levels["critical"]
+                if mode in ["greater", "greater_equal"]:
+                    processed_data.loc[processed_data[field] > critical_threshold, severity_field] = "critical"
+                elif mode in ["less", "less_equal"]:
+                    processed_data.loc[processed_data[field] < critical_threshold, severity_field] = "critical"
         
-        result_df = pd.DataFrame({
-            output_freq_field: frequencies,
-            output_amp_field: np.abs(fft_result)
-        })
-        self.logger.info(f"Applied Fourier Transform to '{field}'. Resulting DataFrame has {len(result_df)} rows.")
-        return result_df
-
-# --- Low Pass Filter Function ---
-@register_function
-class LowPassFilterFunction(BaseFunction):
-    name = "LowPassFilter"
-    description = "应用低通滤波器以去除高频噪声"
-    config_schema = {
-        "$schema": "http://json-schema.org/draft-07/schema#",
-        "title": "LowPassFilter Configuration",
-        "type": "object",
-        "properties": {
-            "field": {"type": "string", "default": "value", "description": "要滤波的数值列名"},
-            "cutoff": {"type": "number", "default": 0.1, "description": "截止频率 (0.0 到 0.5)", "minimum": 0.0, "maximum": 0.5},
-            "order": {"type": "integer", "default": 4, "description": "滤波器阶数", "minimum": 1},
-            "output_field": {"type": "string", "description": "滤波结果的新列名 (默认为原列名_filtered)"}
-        },
-        "required": ["field", "cutoff", "order"],
-        "additionalProperties": False
-    }
-
-    def run(self, data: pd.DataFrame, config: Dict[str, Any]) -> pd.DataFrame:
-        field = config.get("field", "value")
-        cutoff = config.get("cutoff", 0.1)
-        order = config.get("order", 4)
-        output_field = config.get("output_field", f"{field}_filtered")
-
-        self._validate_columns(data, [field])
-        self._validate_numeric_column(data, field)
-        
-        processed_data = data.copy()
-
-        if len(processed_data) < order + 1:
-            self.logger.warning(f"Not enough data points ({len(processed_data)}) for filter order ({order}). Skipping LowPassFilter for '{field}'. Output column '{output_field}' will be filled with original values.")
-            processed_data[output_field] = processed_data[field] # Add the column with original values
-            return processed_data
-
-        try:
-            b, a = butter(order, cutoff, btype='low', analog=False)
-            processed_data[output_field] = filtfilt(b, a, processed_data[field].values)
-            self.logger.info(f"Applied LowPassFilter to '{field}' (cutoff={cutoff}, order={order}). New column: {output_field}")
-        except Exception as e:
-            self.logger.error(f"Error applying LowPassFilter to '{field}': {e}. Output column '{output_field}' will be filled with original values.", exc_info=True)
-            processed_data[output_field] = processed_data[field] # Fallback to original values on error
+        alarm_count = processed_data[alarm_output_field].sum()
+        self.logger.info(f"Applied ThresholdAlarm to '{field}' (mode='{mode}'). Found {alarm_count} alarms.")
         return processed_data
-
-# --- Simple PID Controller Function (Stateless for Batch Processing) ---
-@register_function
-class PIDControllerFunction(BaseFunction):
-    name = "PIDController"
-    description = "基于目标值的简易 PID 控制器 (批量无状态计算)"
-    config_schema = {
-        "$schema": "http://json-schema.org/draft-07/schema#",
-        "title": "PIDController Configuration",
-        "type": "object",
-        "properties": {
-            "field": {"type": "string", "default": "value", "description": "当前过程值（PV）的列名"},
-            "target": {"type": "number", "default": 100, "description": "目标设定点（SP）"},
-            "Kp": {"type": "number", "default": 1.0, "description": "比例增益"},
-            "Ki": {"type": "number", "default": 0.1, "description": "积分增益"},
-            "Kd": {"type": "number", "default": 0.01, "description": "微分增益"},
-            "output_error_field": {"type": "string", "default": "error", "description": "误差列名"},
-            "output_integral_field": {"type": "string", "default": "integral", "description": "积分项列名"},
-            "output_derivative_field": {"type": "string", "default": "derivative", "description": "微分项列名"},
-            "output_control_field": {"type": "string", "default": "control_output", "description": "控制输出列名"},
-            "initial_integral": {"type": "number", "default": 0.0, "description": "积分项的初始值 (仅用于批量计算)"},
-            "initial_previous_error": {"type": "number", "default": 0.0, "description": "上一个时间步的误差值 (仅用于批量计算)"}
-        },
-        "required": ["field", "target", "Kp", "Ki", "Kd"],
-        "additionalProperties": False
-    }
-
-    def run(self, data: pd.DataFrame, config: Dict[str, Any]) -> pd.DataFrame:
-        field = config.get("field", "value")
-        target = config["target"]
-        Kp, Ki, Kd = config["Kp"], config["Ki"], config["Kd"]
-        initial_integral = config.get("initial_integral", 0.0)
-        initial_previous_error = config.get("initial_previous_error", 0.0)
-        
-        error_field = config.get("output_error_field", "error")
-        integral_field = config.get("output_integral_field", "integral")
-        derivative_field = config.get("output_derivative_field", "derivative")
-        control_field = config.get("output_control_field", "control_output")
-
-        self._validate_columns(data, [field])
-        self._validate_numeric_column(data, field)
-
-        processed_data = data.copy()
-        
-        error = target - processed_data[field]
-        processed_data[error_field] = error
-        
-        # Cumulative sum for integral, starting from initial_integral
-        processed_data[integral_field] = error.cumsum() + initial_integral
-        
-        # First difference for derivative, fillna(0) for the first element
-        # and adjust for initial_previous_error for the first actual diff
-        diff_error = error.diff()
-        if not diff_error.empty:
-            diff_error.iloc[0] = error.iloc[0] - initial_previous_error
-        processed_data[derivative_field] = diff_error.fillna(0)
-        
-        processed_data[control_field] = Kp * processed_data[error_field] + \
-                                        Ki * processed_data[integral_field] + \
-                                        Kd * processed_data[derivative_field]
-        
-        self.logger.info(f"Applied PID controller to '{field}' (Target={target}, Kp={Kp}, Ki={Ki}, Kd={Kd}).")
-        
-        # Note: For a truly stateful PID, the last_error and integral would be stored in the function instance
-        # or an external state store between calls for real-time applications.
-        # This implementation is for batch processing where each 'run' is an independent calculation.
-        return processed_data
-
-# --- AI Model Prediction Function ---
-
-# ModelLoader (Placeholder - implement based on your actual ML framework)
-class ModelLoader:
-    def __init__(self, model_path: str, expected_features: Optional[List[str]] = None):
-        self.model_path = model_path
-        self._model = None
-        self.expected_features = expected_features
-        self.logger = logging.getLogger(self.__class__.__name__)
-        self._load_model()
-
-    def _load_model(self):
-        """
-        Loads the machine learning model from the specified path.
-        Replace this with your actual model loading logic (e.g., joblib.load, tf.keras.models.load_model).
-        """
-        try:
-            # Example: Load a scikit-learn model or a dummy object for demonstration
-            # For a real scenario: self._model = joblib.load(self.model_path)
-            
-            # --- MOCK MODEL FOR DEMONSTRATION ---
-            class MockPredictor:
-                def __init__(self, expected_features_mock: Optional[List[str]]):
-                    self.expected_features_mock = expected_features_mock
-                    self.logger = logging.getLogger(self.__class__.__name__ + ".MockPredictor")
-                    self.logger.debug(f"MockPredictor initialized with expected features: {expected_features_mock}")
-
-                def predict(self, X_input: pd.DataFrame) -> np.ndarray:
-                    if self.expected_features_mock and not X_input.columns.equals(pd.Index(self.expected_features_mock)):
-                        self.logger.warning(f"Mock predictor: Input features {X_input.columns.tolist()} do not match expected features {self.expected_features_mock}. Prediction might be inaccurate or fail.")
-                        # You could raise an error here or try to reorder columns
-                        # For now, let's assume it proceeds if the critical feature exists.
-                    
-                    if 'current_temperature' in X_input.columns:
-                        return (X_input['current_temperature'] * 0.8 + 5 + np.random.rand(len(X_input)) * 2).values # Added some noise
-                    elif not X_input.empty:
-                        self.logger.warning("Mock predictor: 'current_temperature' not in input features for mock prediction. Returning zeros.")
-                        return np.zeros(len(X_input))
-                    else:
-                        return np.array([])
-            self._model = MockPredictor(self.expected_features)
-            self.logger.info(f"Successfully loaded mock model for path: {self.model_path}")
-            # --- END MOCK MODEL ---
-
-        except FileNotFoundError:
-            self.logger.error(f"Model file not found at: {self.model_path}")
-            self._model = None
-        except Exception as e:
-            self.logger.error(f"Error loading model from {self.model_path}: {e}", exc_info=True)
-            self._model = None
-
-    def predict(self, X: pd.DataFrame) -> np.ndarray:
-        """
-        Performs prediction using the loaded model.
-        :param X: Input features DataFrame.
-        :return: Array of prediction results.
-        """
-        if self._model is None:
-            self.logger.error(f"Model not loaded for path: {self.model_path}. Cannot predict.")
-            return np.array([])
-        
-        if X.empty:
-            self.logger.warning("Input DataFrame for prediction is empty. Returning empty array.")
-            return np.array([])
-        
-        # Ensure features match expected order/set if `expected_features` is provided
-        if self.expected_features:
-            missing_features = [f for f in self.expected_features if f not in X.columns]
-            if missing_features:
-                self.logger.error(f"Missing required features for prediction: {missing_features}.")
-                return np.array([])
-            
-            # Reorder columns to match expected features
-            try:
-                X_ordered = X[self.expected_features]
-            except KeyError as e:
-                self.logger.error(f"Error reordering features for prediction. Check if features list is correct: {e}", exc_info=True)
-                return np.array([])
-        else:
-            X_ordered = X # Proceed with given columns if no expected features are specified
-
-        try:
-            return self._model.predict(X_ordered)
-        except Exception as e:
-            self.logger.error(f"Error during model prediction with input shape {X_ordered.shape}: {e}", exc_info=True)
-            return np.array([])
-
-
-@register_function
-class PredictModelFunction(BaseFunction):
-    name = "PredictModel"
-    description = "加载并使用机器学习模型进行预测"
-    config_schema = {
-        "$schema": "http://json-schema.org/draft-07/schema#",
-        "title": "PredictModel Configuration",
-        "type": "object",
-        "properties": {
-            "model_path": {"type": "string", "description": "模型文件路径"},
-            "features": {"type": "array", "items": {"type": "string"}, "minItems": 1, "description": "要使用的特征列名"},
-            "output_column": {"type": "string", "default": "prediction", "description": "预测结果的列名"}
-        },
-        "required": ["model_path", "features"],
-        "additionalProperties": False
-    }
-
-    def __init__(self):
-        super().__init__()
-        self.loader_cache: Dict[str, ModelLoader] = {} # Cache for model loaders
-
-    def run(self, data: pd.DataFrame, config: Dict[str, Any]) -> pd.DataFrame:
-        path = config["model_path"]
-        features = config["features"]
-        output_column = config.get("output_column", "prediction")
-
-        self._validate_columns(data, features) # Ensure all required feature columns exist
-
-        processed_data = data.copy()
-
-        if path not in self.loader_cache:
-            # Pass expected features to ModelLoader for internal validation
-            self.loader_cache[path] = ModelLoader(path, expected_features=features) 
-            self.logger.info(f"Initialized ModelLoader for path: {path}")
-        loader = self.loader_cache[path]
-
-        X_input = processed_data[features]
-        preds = loader.predict(X_input)
-        
-        # Check if predictions were made and match the input data length
-        if preds.size > 0 and len(preds) == len(processed_data):
-            processed_data[output_column] = preds
-            self.logger.info(f"Predictions generated and saved to column '{output_column}'.")
-        else:
-            self.logger.warning(f"Prediction result size mismatch or empty for path '{path}'. No predictions added to column '{output_column}'. Filling with NaN.")
-            processed_data[output_column] = np.nan # Or other default value for failed predictions
-
-        return processed_data
-
-# --- Helper Functions for Registry and Execution ---
-
-def get_all_functions_meta() -> List[Dict[str, Any]]:
-    """
-    Returns metadata for all registered functions, including their name,
-    description, and configuration schema.
-    """
-    return [
-        {
-            "name": cls.name,
-            "description": cls.description,
-            "config_schema": cls.config_schema
-        }
-        for cls in FUNCTION_REGISTRY.values()
-    ]
-
-def run_function(function_name: str, data: pd.DataFrame, config: Dict[str, Any]) -> pd.DataFrame:
-    """
-    Executes a registered function with the given data and configuration.
-    :param function_name: The 'name' of the function as registered.
-    :param data: The input Pandas DataFrame.
-    :param config: The configuration dictionary for the function.
-    :return: The DataFrame returned by the function.
-    :raises ValueError: If the function is not registered or configuration is invalid.
-    :raises jsonschema.ValidationError: If the configuration does not match the function's schema.
-    """
-    fn_class = FUNCTION_REGISTRY.get(function_name)
-    if not fn_class:
-        raise ValueError(f"Function '{function_name}' not registered.")
-    
-    # JSON Schema validation
-    try:
-        jsonschema.validate(instance=config, schema=fn_class.config_schema)
-    except jsonschema.ValidationError as e:
-        # Provide a more user-friendly error message, extracting key details
-        error_path = ".".join(map(str, e.path)) if e.path else "root"
-        raise ValueError(f"Invalid configuration for function '{function_name}': {e.message} at '{error_path}'. Check function's config_schema.") from e
-
-    instance = fn_class() # Instantiate the function class
-    instance.logger.info(f"Starting execution of function '{instance.name}' with config: {config}")
-    
-    # Pass a copy of the DataFrame to the function's run method
-    # This ensures that the original DataFrame remains untouched if the function modifies its input in-place
-    # (though functions are encouraged to return a new DataFrame).
-    result_df = instance.run(data.copy(), config) # Ensure copy is passed
-    
-    instance.logger.info(f"Finished execution of function '{instance.name}'. Result shape: {result_df.shape}")
-    return result_df
-
-# --- New Functions ---
-
-@register_function
-class LinearRegressionPredictorFunction(BaseFunction):
-    name = "LinearRegressionPredictor"
-    description = "基于时间的线性回归预测下一个值"
-    config_schema = {
-        "$schema": "http://json-schema.org/draft-07/schema#",
-        "title": "LinearRegressionPredictor Configuration",
-        "type": "object",
-        "properties": {
-            "predict_steps": {"type": "integer", "default": 1, "description": "预测多少步", "minimum": 1},
-            "time_field": {"type": "string", "default": "time", "description": "时间列名"},
-            "field": {"type": "string", "default": "value", "description": "预测值列名"},
-            "prediction_output_field": {"type": "string", "default": "predicted_value", "description": "预测结果的新列名"},
-            "is_prediction_flag_field": {"type": "string", "default": "is_prediction", "description": "标记是否为预测值的布尔列名"}
-        },
-        "required": ["time_field", "field"],
-        "additionalProperties": False
-    }
-
-    def run(self, data: pd.DataFrame, config: dict) -> pd.DataFrame:
-        predict_steps = config.get("predict_steps", 1)
-        time_field = config.get("time_field", "time")
-        field = config.get("field", "value")
-        prediction_output_field = config.get("prediction_output_field", "predicted_value")
-        is_prediction_flag_field = config.get("is_prediction_flag_field", "is_prediction")
-
-        self._validate_columns(data, [time_field, field])
-        self._validate_numeric_column(data, field)
-
-        processed_data = data.copy()
-
-        if processed_data.empty:
-            self.logger.warning("Input DataFrame is empty. Cannot perform LinearRegressionPrediction. Returning empty DataFrame.")
-            return pd.DataFrame(columns=[time_field, field, prediction_output_field, is_prediction_flag_field])
-
-        # Convert time to integer timestamps (seconds or milliseconds) for regression
-        # Use pd.to_datetime safely first
-        if not pd.api.types.is_datetime64_any_dtype(processed_data[time_field]):
-            try:
-                processed_data[time_field] = pd.to_datetime(processed_data[time_field])
-                self.logger.debug(f"Converted '{time_field}' to datetime type for regression.")
-            except Exception as e:
-                self.logger.error(f"Failed to convert '{time_field}' to datetime. Cannot perform linear regression prediction: {e}", exc_info=True)
-                return data.assign(**{prediction_output_field:np.nan, is_prediction_flag_field:False}) # Add columns with nan/False
-
-        # Ensure time is sorted for correct differencing if necessary, and for future prediction
-        processed_data.sort_values(by=time_field, inplace=True)
-        
-        # Use total seconds from an arbitrary epoch or just milliseconds from start for better precision
-        # Or, just use integer seconds for simplicity as in original
-        processed_data["_time_numeric"] = (processed_data[time_field] - processed_data[time_field].iloc[0]).dt.total_seconds()
-        
-        X = processed_data[["_time_numeric"]].values
-        y = processed_data[field].values
-        
-        if len(X) < 2:
-            self.logger.warning(f"Not enough data points ({len(X)}) for linear regression. Need at least 2 points. Skipping prediction.")
-            return processed_data.assign(**{prediction_output_field:np.nan, is_prediction_flag_field:False}).drop(columns=["_time_numeric"])
-
-        model = LinearRegression()
-        model.fit(X, y)
-
-        # Calculate time step from existing data to project future times
-        # If timestamps are not uniform, this might need refinement (e.g., average step)
-        # Using the last interval for simplicity
-        time_diffs = np.diff(processed_data["_time_numeric"].values)
-        if time_diffs.size > 0:
-            avg_step = time_diffs.mean()
-        else: # Should not happen if len(X) >= 2, but for safety
-            avg_step = 1 # Fallback to 1 second step if no diffs
-
-        last_numeric_time = processed_data["_time_numeric"].iloc[-1]
-        last_datetime = processed_data[time_field].iloc[-1]
-
-        future_numeric_times = np.array([[last_numeric_time + i * avg_step] for i in range(1, predict_steps + 1)])
-        future_datetimes = [last_datetime + pd.Timedelta(seconds=i * avg_step) for i in range(1, predict_steps + 1)]
-
-        predictions = model.predict(future_numeric_times)
-
-        # Create DataFrame for predictions
-        prediction_df = pd.DataFrame({
-            time_field: future_datetimes,
-            prediction_output_field: predictions,
-            is_prediction_flag_field: True
-        })
-        
-        # Original data will have the predicted value column as NaN and flag as False
-        # Create output DataFrame by adding the new columns to the original data
-        original_data_with_prediction_cols = processed_data.assign(**{
-            prediction_output_field: np.nan,
-            is_prediction_flag_field: False
-        }).drop(columns=["_time_numeric"]) # Drop temporary numeric time column
-
-        # Concatenate original data with predictions
-        result_df = pd.concat([original_data_with_prediction_cols, prediction_df], ignore_index=True)
-        
-        self.logger.info(f"Applied LinearRegressionPredictor to '{field}' predicting {predict_steps} steps. Added '{prediction_output_field}' and '{is_prediction_flag_field}' columns.")
-        return result_df
-
 
 @register_function
 class RateOfChangeAlarmFunction(BaseFunction):
-    name = "RateOfChangeAlarm"
-    description = "基于变化速率的告警"
+    metadata = FunctionMetadata(
+        name="RateOfChangeAlarm",
+        description="基于变化速率的告警",
+        category=FunctionCategory.ALARM,
+        tags=["alarm", "monitoring", "rate-of-change", "derivative"]
+    )
+    
     config_schema = {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "title": "RateOfChangeAlarm Configuration",
         "type": "object",
         "properties": {
-            "rate_threshold": {"type": "number", "default": 10.0, "description": "允许最大变化速率 (绝对值)", "minimum": 0},
             "field": {"type": "string", "default": "value", "description": "计算速率的字段"},
-            "rate_output_field": {"type": "string", "default": "rate_of_change", "description": "变化速率结果列名"},
-            "alarm_output_field": {"type": "string", "default": "rate_alarm", "description": "速率告警标记结果列名"}
+            "rate_threshold": {"type": "number", "default": 10.0, "description": "速率阈值", "minimum": 0},
+            "time_field": {"type": "string", "description": "时间列名（可选）"},
+            "rate_type": {"type": "string", "enum": ["absolute", "percentage"], "default": "absolute", "description": "速率类型"},
+            "window": {"type": "integer", "minimum": 1, "description": "计算速率的窗口大小"},
+            "rate_output_field": {"type": "string", "default": "rate_of_change", "description": "变化速率列名"},
+            "alarm_output_field": {"type": "string", "default": "rate_alarm", "description": "速率告警列名"}
         },
         "required": ["field"],
         "additionalProperties": False
     }
 
     def run(self, data: pd.DataFrame, config: dict) -> pd.DataFrame:
-        rate_threshold = config.get("rate_threshold", 10.0)
         field = config.get("field", "value")
+        rate_threshold = config.get("rate_threshold", 10.0)
+        time_field = config.get("time_field")
+        rate_type = config.get("rate_type", "absolute")
+        window = config.get("window", 1)
         rate_output_field = config.get("rate_output_field", "rate_of_change")
         alarm_output_field = config.get("alarm_output_field", "rate_alarm")
 
@@ -959,190 +861,472 @@ class RateOfChangeAlarmFunction(BaseFunction):
 
         processed_data = data.copy()
         
-        # Calculate rate of change
-        processed_data[rate_output_field] = processed_data[field].diff()
+        # 计算变化率
+        if time_field:
+            self._validate_columns(data, [time_field])
+            # 基于时间的变化率
+            if not pd.api.types.is_datetime64_any_dtype(processed_data[time_field]):
+                processed_data[time_field] = pd.to_datetime(processed_data[time_field])
+            
+            time_diff = processed_data[time_field].diff(window).dt.total_seconds()
+            value_diff = processed_data[field].diff(window)
+            processed_data[rate_output_field] = value_diff / time_diff
+        else:
+            # 简单差分
+            if rate_type == "absolute":
+                processed_data[rate_output_field] = processed_data[field].diff(window)
+            else:  # percentage
+                processed_data[rate_output_field] = processed_data[field].pct_change(window) * 100
         
-        # Mark alarm. First row will be False due to NaN from diff()
+        # 告警判断
         processed_data[alarm_output_field] = processed_data[rate_output_field].abs() > rate_threshold
         
-        self.logger.info(f"Applied RateOfChangeAlarm to '{field}' (threshold={rate_threshold}). Added '{rate_output_field}' and '{alarm_output_field}' columns.")
+        alarm_count = processed_data[alarm_output_field].sum()
+        self.logger.info(f"Applied RateOfChangeAlarm to '{field}' (threshold={rate_threshold}). Found {alarm_count} alarms.")
         return processed_data
 
-
 @register_function
-class TrendDetectorFunction(BaseFunction):
-    name = "TrendDetector"
-    description = "判断趋势方向（上升/下降/平稳/未知）"
+class CombinedAlarmFunction(BaseFunction):
+    metadata = FunctionMetadata(
+        name="CombinedAlarm",
+        description="组合多个条件的复合告警",
+        category=FunctionCategory.ALARM,
+        tags=["alarm", "monitoring", "composite", "logic"]
+    )
+    
     config_schema = {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "title": "TrendDetector Configuration",
         "type": "object",
         "properties": {
-            "field": {"type": "string", "default": "value", "description": "判断趋势的字段"},
-            "tolerance": {"type": "number", "default": 1e-6, "description": "判断为'平稳'的数值变化容忍度", "minimum": 0},
-            "trend_output_field": {"type": "string", "default": "trend", "description": "趋势结果列名"}
+            "conditions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "field": {"type": "string"},
+                        "operator": {"type": "string", "enum": ["gt", "lt", "eq", "ne", "ge", "le"]},
+                        "value": {"type": "number"}
+                    },
+                    "required": ["field", "operator", "value"]
+                },
+                "minItems": 1,
+                "description": "告警条件列表"
+            },
+            "logic": {"type": "string", "enum": ["and", "or"], "default": "and", "description": "条件组合逻辑"},
+            "alarm_output_field": {"type": "string", "default": "combined_alarm", "description": "组合告警标记列名"}
+        },
+        "required": ["conditions"],
+        "additionalProperties": False
+    }
+
+    def run(self, data: pd.DataFrame, config: dict) -> pd.DataFrame:
+        conditions = config["conditions"]
+        logic = config.get("logic", "and")
+        alarm_output_field = config.get("alarm_output_field", "combined_alarm")
+
+        processed_data = data.copy()
+        condition_results = []
+
+        for cond in conditions:
+            field = cond["field"]
+            operator = cond["operator"]
+            value = cond["value"]
+            
+            self._validate_columns(data, [field])
+            
+            if operator == "gt":
+                result = processed_data[field] > value
+            elif operator == "lt":
+                result = processed_data[field] < value
+            elif operator == "eq":
+                result = processed_data[field] == value
+            elif operator == "ne":
+                result = processed_data[field] != value
+            elif operator == "ge":
+                result = processed_data[field] >= value
+            elif operator == "le":
+                result = processed_data[field] <= value
+            
+            condition_results.append(result)
+        
+        # 组合条件
+        if logic == "and":
+            processed_data[alarm_output_field] = np.logical_and.reduce(condition_results)
+        else:  # or
+            processed_data[alarm_output_field] = np.logical_or.reduce(condition_results)
+        
+        alarm_count = processed_data[alarm_output_field].sum()
+        self.logger.info(f"Applied CombinedAlarm with {len(conditions)} conditions (logic='{logic}'). Found {alarm_count} alarms.")
+        return processed_data
+
+# --- Aggregation Functions ---
+
+@register_function
+class AggregatorFunction(BaseFunction):
+    metadata = FunctionMetadata(
+        name="Aggregator",
+        description="按时间和分组聚合数据",
+        category=FunctionCategory.AGGREGATION,
+        tags=["aggregation", "time-series", "groupby", "resampling"]
+    )
+    
+    config_schema = {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": {
+            "time_field": {"type": "string", "default": "time", "description": "时间列名"},
+            "value_fields": {
+                "type": "array", 
+                "items": {"type": "string"},
+                "description": "要聚合的数值列名列表"
+            },
+            "interval": {"type": "string", "default": "1min", "description": "聚合时间粒度"},
+            "method": {
+                "type": "string", 
+                "default": "mean", 
+                "enum": ["mean", "sum", "max", "min", "first", "last", "count", "median", "std", "var"],
+                "description": "聚合方法"
+            },
+            "group_by_fields": {
+                "type": "array", 
+                "items": {"type": "string"}, 
+                "description": "分组字段"
+            },
+            "fill_method": {
+                "type": "string",
+                "enum": ["none", "ffill", "bfill", "linear"],
+                "default": "none",
+                "description": "填充方法"
+            }
+        },
+        "required": ["time_field", "interval", "method"],
+        "additionalProperties": False
+    }
+
+    def run(self, data: pd.DataFrame, config: dict) -> pd.DataFrame:
+        time_field = config.get("time_field", "time")
+        value_fields = config.get("value_fields")
+        interval = config.get("interval", "1min")
+        method = config.get("method", "mean")
+        group_by_fields = config.get("group_by_fields", [])
+        fill_method = config.get("fill_method", "none")
+
+        # 验证列
+        required_cols = [time_field] + (value_fields or []) + group_by_fields
+        self._validate_columns(data, required_cols)
+
+        processed_data = data.copy()
+        
+        if processed_data.empty:
+            self.logger.warning("Input DataFrame is empty. Returning empty DataFrame.")
+            return pd.DataFrame()
+
+        # 转换时间列
+        if not pd.api.types.is_datetime64_any_dtype(processed_data[time_field]):
+            try:
+                processed_data[time_field] = pd.to_datetime(processed_data[time_field])
+            except Exception as e:
+                self.logger.error(f"Failed to convert '{time_field}' to datetime: {e}")
+                return data.copy()
+
+        processed_data.set_index(time_field, inplace=True)
+        
+        # 确定要聚合的列
+        if not value_fields:
+            # 如果未指定，使用所有数值列
+            value_fields = processed_data.select_dtypes(include=[np.number]).columns.tolist()
+            if group_by_fields:
+                value_fields = [f for f in value_fields if f not in group_by_fields]
+
+        if group_by_fields:
+            grouped = processed_data.groupby(group_by_fields).resample(interval)[value_fields]
+        else:
+            grouped = processed_data.resample(interval)[value_fields]
+
+        # 执行聚合
+        if hasattr(grouped, method):
+            aggregated_data = getattr(grouped, method)()
+        else:
+            self.logger.error(f"Aggregation method '{method}' not supported.")
+            return pd.DataFrame()
+        
+        # 重置索引
+        aggregated_data = aggregated_data.reset_index()
+        
+        # 填充缺失值
+        if fill_method != "none" and fill_method:
+            if fill_method == "linear":
+                for field in value_fields:
+                    aggregated_data[field] = aggregated_data[field].interpolate(method="linear")
+            else:
+                aggregated_data[value_fields] = aggregated_data[value_fields].fillna(method=fill_method)
+        
+        self.logger.info(f"Aggregated data by '{interval}' using '{method}' method. Result has {len(aggregated_data)} rows.")
+        return aggregated_data
+
+# --- I/O Functions ---
+
+@register_function
+class CSVExporterFunction(BaseFunction):
+    metadata = FunctionMetadata(
+        name="CSVExporter",
+        description="导出数据到CSV文件",
+        category=FunctionCategory.IO,
+        tags=["export", "csv", "file", "output"]
+    )
+    
+    config_schema = {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": {
+            "file_path": {"type": "string", "default": "./output.csv", "description": "输出文件路径"},
+            "index": {"type": "boolean", "default": False, "description": "是否写入索引"},
+            "encoding": {"type": "string", "default": "utf-8", "description": "文件编码"},
+            "sep": {"type": "string", "default": ",", "description": "分隔符"},
+            "columns": {"type": "array", "items": {"type": "string"}, "description": "要导出的列"},
+            "append": {"type": "boolean", "default": False, "description": "是否追加到文件"},
+            "header": {"type": "boolean", "default": True, "description": "是否写入列名"},
+            "raise_on_error": {"type": "boolean", "default": False, "description": "失败时是否抛出异常"}
+        },
+        "additionalProperties": False
+    }
+
+    def run(self, data: pd.DataFrame, config: Dict[str, Any]) -> pd.DataFrame:
+        file_path = config.get("file_path", "./output.csv")
+        include_index = config.get("index", False)
+        encoding = config.get("encoding", "utf-8")
+        sep = config.get("sep", ",")
+        columns = config.get("columns")
+        append = config.get("append", False)
+        header = config.get("header", True)
+        raise_on_error = config.get("raise_on_error", False)
+
+        # 选择要导出的列
+        export_data = data[columns] if columns else data
+
+        try:
+            mode = 'a' if append else 'w'
+            header = header and not append  # 追加模式下不写入列名
+            
+            export_data.to_csv(
+                file_path, 
+                index=include_index, 
+                encoding=encoding,
+                sep=sep,
+                mode=mode,
+                header=header
+            )
+            self.logger.info(f"Data successfully exported to {file_path} ({len(export_data)} rows)")
+        except Exception as e:
+            self.logger.error(f"Failed to export data to CSV: {e}", exc_info=True)
+            if raise_on_error:
+                raise
+                
+        return data  # 返回原始数据
+
+# --- Signal Processing Functions ---
+
+@register_function
+class FourierTransformFunction(BaseFunction):
+    metadata = FunctionMetadata(
+        name="FourierTransform",
+        description="快速傅里叶变换分析频率成分",
+        category=FunctionCategory.ANALYSIS,
+        tags=["signal-processing", "frequency", "fft", "spectral"]
+    )
+    
+    config_schema = {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": {
+            "field": {"type": "string", "default": "value", "description": "要进行FFT的列名"},
+            "sampling_rate": {"type": "number", "description": "采样率(Hz)"},
+            "output_type": {
+                "type": "string",
+                "enum": ["full", "magnitude", "phase", "power"],
+                "default": "magnitude",
+                "description": "输出类型"
+            },
+            "normalize": {"type": "boolean", "default": True, "description": "是否归一化"},
+            "return_dataframe": {"type": "boolean", "default": True, "description": "是否返回频率分析结果"}
         },
         "required": ["field"],
         "additionalProperties": False
     }
 
-    def run(self, data: pd.DataFrame, config: dict) -> pd.DataFrame:
+    def run(self, data: pd.DataFrame, config: Dict[str, Any]) -> pd.DataFrame:
         field = config.get("field", "value")
-        tolerance = config.get("tolerance", 1e-6)
-        trend_output_field = config.get("trend_output_field", "trend")
-        
+        sampling_rate = config.get("sampling_rate", 1.0)
+        output_type = config.get("output_type", "magnitude")
+        normalize = config.get("normalize", True)
+        return_df = config.get("return_dataframe", True)
+
         self._validate_columns(data, [field])
         self._validate_numeric_column(data, field)
 
-        processed_data = data.copy()
-        
-        # Calculate difference. First value will be NaN.
-        diff_values = processed_data[field].diff()
+        y = data[field].dropna().values
+        if len(y) == 0:
+            self.logger.warning(f"No valid data in field '{field}' for FFT.")
+            return pd.DataFrame()
 
-        # Apply trend logic. Using fillna("unknown") for the first row or any NaNs
-        # Using an epsilon/tolerance for 'flat' trend
-        processed_data[trend_output_field] = diff_values.apply(
-            lambda x: "up" if x > tolerance else \
-                      ("down" if x < -tolerance else \
-                       ("flat" if pd.notna(x) else "unknown"))
-        )
+        # 执行FFT
+        fft_result = np.fft.fft(y)
+        frequencies = np.fft.fftfreq(len(y), 1/sampling_rate)
         
-        self.logger.info(f"Applied TrendDetector to '{field}' (tolerance={tolerance}). Added '{trend_output_field}' column.")
+        # 只保留正频率部分
+        positive_freq_idx = frequencies > 0
+        frequencies = frequencies[positive_freq_idx]
+        fft_result = fft_result[positive_freq_idx]
+        
+        # 计算输出
+        if output_type == "magnitude":
+            values = np.abs(fft_result)
+        elif output_type == "phase":
+            values = np.angle(fft_result)
+        elif output_type == "power":
+            values = np.abs(fft_result) ** 2
+        else:  # full
+            values = fft_result
+        
+        # 归一化
+        if normalize and output_type in ["magnitude", "power"]:
+            values = values / np.max(values)
+        
+        if return_df:
+            result_df = pd.DataFrame({
+                "frequency": frequencies,
+                f"{field}_fft_{output_type}": values
+            })
+            self.logger.info(f"Applied FFT to '{field}'. Result has {len(result_df)} frequency components.")
+            return result_df
+        else:
+            # 添加频率分析结果到原数据
+            processed_data = data.copy()
+            # 存储主频率和幅值
+            dominant_freq_idx = np.argmax(np.abs(values))
+            processed_data[f"{field}_dominant_frequency"] = frequencies[dominant_freq_idx]
+            processed_data[f"{field}_dominant_amplitude"] = values[dominant_freq_idx]
+            return processed_data
+
+@register_function
+class LowPassFilterFunction(BaseFunction):
+    metadata = FunctionMetadata(
+        name="LowPassFilter",
+        description="低通滤波器去除高频噪声",
+        category=FunctionCategory.FILTER,
+        tags=["signal-processing", "filter", "denoising", "smoothing"]
+    )
+    
+    config_schema = {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": {
+            "field": {"type": "string", "default": "value", "description": "要滤波的列名"},
+            "cutoff": {"type": "number", "default": 0.1, "description": "截止频率", "minimum": 0.0, "maximum": 0.5},
+            "order": {"type": "integer", "default": 4, "description": "滤波器阶数", "minimum": 1},
+            "filter_type": {
+                "type": "string",
+                "enum": ["butterworth", "chebyshev", "elliptic"],
+                "default": "butterworth",
+                "description": "滤波器类型"
+            },
+            "output_field": {"type": "string", "description": "滤波结果列名"}
+        },
+        "required": ["field", "cutoff"],
+        "additionalProperties": False
+    }
+
+    def run(self, data: pd.DataFrame, config: Dict[str, Any]) -> pd.DataFrame:
+        field = config.get("field", "value")
+        cutoff = config.get("cutoff", 0.1)
+        order = config.get("order", 4)
+        filter_type = config.get("filter_type", "butterworth")
+        output_field = config.get("output_field", f"{field}_filtered")
+
+        self._validate_columns(data, [field])
+        self._validate_numeric_column(data, field)
+        
+        processed_data = data.copy()
+
+        if len(processed_data) < order + 1:
+            self.logger.warning(f"Not enough data points for filter order {order}. Skipping filtering.")
+            processed_data[output_field] = processed_data[field]
+            return processed_data
+
+        try:
+            # 设计滤波器
+            if filter_type == "butterworth":
+                b, a = butter(order, cutoff, btype='low', analog=False)
+            else:
+                # 其他滤波器类型需要额外参数，这里简化为Butterworth
+                self.logger.warning(f"Filter type '{filter_type}' not fully implemented. Using Butterworth.")
+                b, a = butter(order, cutoff, btype='low', analog=False)
+            
+            # 应用滤波器
+            processed_data[output_field] = filtfilt(b, a, processed_data[field].values)
+            
+            self.logger.info(f"Applied {filter_type} low-pass filter to '{field}' (cutoff={cutoff}, order={order}).")
+        except Exception as e:
+            self.logger.error(f"Error applying filter: {e}")
+            processed_data[output_field] = processed_data[field]
+            
         return processed_data
 
-# --- Example Usage ---
-if __name__ == "__main__":
-    # Configure the root logger directly for the example run
-    logging.getLogger().setLevel(logging.DEBUG) # Set to DEBUG to see all messages including info/debug
-    # logging.basicConfig is typically called once at app startup, here we ensure it's set for the script.
-
-    df_initial = pd.DataFrame({
-        "time": pd.to_datetime(["2025-07-07 14:00:00", "2025-07-07 14:01:00", "2025-07-07 14:02:00",
-                                "2025-07-07 14:03:00", "2025-07-07 14:04:00", "2025-07-07 14:05:00",
-                                "2025-07-07 14:06:00", "2025-07-07 14:07:00", "2025-07-07 14:08:00",
-                                "2025-07-07 14:09:00"]),
-        "value": [70, 75, np.nan, 85, 82, 90, 95, 88, np.nan, 81],
-        "device_id": ["sensor_A"]*5 + ["sensor_B"]*5,
-        "temperature": [25.1, 25.5, 25.0, 26.1, 26.5, 27.0, 27.5, 27.1, 26.8, 26.0],
-        "pressure": [100.1, 100.5, 100.2, 101.0, 101.5, 101.2, 101.8, 101.5, 101.1, 100.9],
-        "sensor_A_val": [10, 12, 11, 13, 14, np.nan, 15, 16, 17, 18] # For PID example
-    })
+@register_function
+class BandPassFilterFunction(BaseFunction):
+    metadata = FunctionMetadata(
+        name="BandPassFilter",
+        description="带通滤波器保留特定频率范围",
+        category=FunctionCategory.FILTER,
+        tags=["signal-processing", "filter", "frequency-selection"]
+    )
     
-    print("--- Original DataFrame ---")
-    print(df_initial.to_string())
-    print("-" * 50)
+    config_schema = {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": {
+            "field": {"type": "string", "default": "value", "description": "要滤波的列名"},
+            "lowcut": {"type": "number", "default": 0.1, "description": "低截止频率", "minimum": 0.0},
+            "highcut": {"type": "number", "default": 0.3, "description": "高截止频率", "minimum": 0.0, "maximum": 0.5},
+            "order": {"type": "integer", "default": 4, "description": "滤波器阶数", "minimum": 1},
+            "output_field": {"type": "string", "description": "滤波结果列名"}
+        },
+        "required": ["field", "lowcut", "highcut"],
+        "additionalProperties": False
+    }
 
-    try:
-        # Step 1: Fill missing values in 'value' column using mean
-        print("\n--- Running FillNAFunction on 'value' ---")
-        df_step1 = run_function("FillNA", df_initial, {"field": "value", "method": "mean"})
-        print(df_step1.to_string())
-        print("-" * 50)
+    def run(self, data: pd.DataFrame, config: Dict[str, Any]) -> pd.DataFrame:
+        field = config.get("field", "value")
+        lowcut = config.get("lowcut", 0.1)
+        highcut = config.get("highcut", 0.3)
+        order = config.get("order", 4)
+        output_field = config.get("output_field", f"{field}_bandpass")
 
-        # Step 2: Calculate Moving Average on the filled 'value' (keep NaN rows for demonstration)
-        print("\n--- Running MovingAverageFunction on 'value' ---")
-        df_step2 = run_function("MovingAverage", df_step1, {"field": "value", "window": 3, "drop_na_rows": False})
-        print(df_step2.to_string())
-        print("-" * 50)
+        self._validate_columns(data, [field])
+        self._validate_numeric_column(data, field)
         
-        # Step 3: Normalize 'temperature'
-        print("\n--- Running NormalizeFunction on 'temperature' ---")
-        df_step3 = run_function("Normalize", df_step2, {"field": "temperature", "output_field": "temp_normalized"})
-        print(df_step3.to_string())
-        print("-" * 50)
+        processed_data = data.copy()
 
-        # Step 4: Apply Threshold Alarm on 'value'
-        print("\n--- Running ThresholdAlarmFunction on 'value' ---")
-        df_step4 = run_function("ThresholdAlarm", df_step3, {"field": "value", "threshold": 85, "mode": "greater"})
-        print(df_step4.to_string())
-        print("-" * 50)
+        if len(processed_data) < order + 1:
+            self.logger.warning(f"Not enough data points for filter order {order}. Skipping filtering.")
+            processed_data[output_field] = processed_data[field]
+            return processed_data
 
-        # Step 5: Aggregate 'value' by device_id and 5-minute interval (mean)
-        print("\n--- Running AggregatorFunction ---")
-        df_step5 = run_function("Aggregator", df_step4, {
-            "time_field": "time", 
-            "value_field": "value", 
-            "interval": "5min", 
-            "method": "mean",
-            "group_by_fields": ["device_id"]
-        })
-        print(df_step5.to_string())
-        print("-" * 50)
+        if lowcut >= highcut:
+            self.logger.error(f"Low cutoff ({lowcut}) must be less than high cutoff ({highcut}).")
+            processed_data[output_field] = processed_data[field]
+            return processed_data
 
-        # Step 6: Make Predictions using PredictModelFunction
-        print("\n--- Running PredictModelFunction ---")
-        # For the mock model, we need 'current_temperature' as a feature.
-        # Let's assume 'temperature' from our initial df is used as 'current_temperature' after preprocessing.
-        df_for_prediction = df_step4.copy() # Use the data after threshold alarm
-        df_for_prediction.rename(columns={"temperature": "current_temperature"}, inplace=True)
-
-        df_predicted = run_function(
-            "PredictModel", 
-            df_for_prediction, 
-            {"model_path": "your_model.pkl", "features": ["current_temperature"], "output_column": "predicted_value"}
-        )
-        print(df_predicted[['time', 'device_id', 'current_temperature', 'predicted_value', 'is_alarm']].to_string())
-        print("-" * 50)
-
-        # Step 7: Apply PID Controller (Stateless Batch)
-        print("\n--- Running PIDControllerFunction ---")
-        df_pid_output = run_function("PIDController", df_initial.copy(), {
-            "field": "temperature",
-            "target": 26.0,
-            "Kp": 0.5,
-            "Ki": 0.05,
-            "Kd": 0.02
-        })
-        print(df_pid_output[['time', 'temperature', 'error', 'integral', 'derivative', 'control_output']].to_string())
-        print("-" * 50)
-
-        # Step 8: Apply Linear Regression Predictor
-        print("\n--- Running LinearRegressionPredictorFunction ---")
-        df_lr_predicted = run_function("LinearRegressionPredictor", df_initial.copy(), {
-            "time_field": "time",
-            "field": "temperature",
-            "predict_steps": 3
-        })
-        print(df_lr_predicted.to_string())
-        print("-" * 50)
-
-        # Step 9: Apply Rate of Change Alarm
-        print("\n--- Running RateOfChangeAlarmFunction ---")
-        df_roc_alarm = run_function("RateOfChangeAlarm", df_initial.copy(), {
-            "field": "temperature",
-            "rate_threshold": 0.2
-        })
-        print(df_roc_alarm[['time', 'temperature', 'rate_of_change', 'rate_alarm']].to_string())
-        print("-" * 50)
-
-        # Step 10: Apply Trend Detector
-        print("\n--- Running TrendDetectorFunction ---")
-        df_trend = run_function("TrendDetector", df_initial.copy(), {
-            "field": "temperature",
-            "tolerance": 0.05
-        })
-        print(df_trend[['time', 'temperature', 'trend']].to_string())
-        print("-" * 50)
-
-        # Step 11: Export data to CSV (e.g., the last processed DataFrame)
-        print("\n--- Running CSVExporterFunction ---")
-        run_function("CSVExporter", df_trend, {"file_path": "./final_processed_data.csv", "index": False, "raise_on_error": True})
-        print("-" * 50)
-
-
-        # Example: Get all function metadata
-        print("\n--- All Registered Functions Metadata ---")
-        for func_meta in get_all_functions_meta():
-            print(f"Name: {func_meta['name']}")
-            print(f"  Description: {func_meta['description']}")
-            print(f"  Config Schema: {func_meta['config_schema']}")
-            print("---")
-
-    except ValueError as e:
-        logging.error(f"Error during function execution: {e}")
-    except TypeError as e:
-        logging.error(f"Type error during function execution: {e}")
-    except jsonschema.ValidationError as e:
-        logging.error(f"Configuration validation error: {e.message} at {e.path}")
-    except Exception as e:
-        logging.error(f"An unexpected error occurred: {e}", exc_info=True)
+        try:
+            # 设计带通滤波器
+            b, a = butter(order, [lowcut, highcut], btype='band', analog=False)
+            
+            # 应用滤波器
+            processed_data[output_field] = filtfilt(b, a, processed_data[field].values)
+            
+            self.logger.info(f"Applied band-pass filter to '{field}' (lowcut={lowcut}, highcut={highcut}, order={order}).")
+        except Exception as e:
+            self.logger.error(f"Error applying band-pass filter: {e}")
+            processed_data[output_field] = processed_data[field]
+            
+        return processed_data

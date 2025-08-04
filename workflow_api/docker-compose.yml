@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  workflow-engine:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - KAFKA_SERVERS=kafka:9092
+      - REDIS_HOST=redis
+    depends_on:
+      - kafka
+      - redis
+    volumes:
+      - ./.env:/app/.env
+
+  kafka:
+    image: confluentinc/cp-kafka:latest
+    environment:
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    depends_on:
+      - zookeeper
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:latest
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+
+  redis:
+    image: redis:alpine
+    ports:
+      - "6379:6379"
