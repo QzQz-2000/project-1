@@ -233,7 +233,7 @@ services:
     image: influxdb:2.7.1
     container_name: influxdb
     ports:
-      - "8086:8086"
+      - "8087:8086"
     volumes:
       - influxdb_data:/var/lib/influxdb2
     environment:
@@ -244,19 +244,19 @@ services:
       DOCKER_INFLUXDB_INIT_BUCKET: mybucket
       DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: mytoken
 
-  kafka-influx-service:
-    build: ./kafka-influx-service # 指向你的服务目录，其中包含 Dockerfile
-    restart: always
-    env_file:
-      - ./kafka-influx-service/.env # 如果 .env 文件也在服务目录里，相应调整路径
-    depends_on:
-      - broker
-    environment: # 确保这里有 Kafka 和 InfluxDB 连接信息
-      KAFKA_BOOTSTRAP_SERVERS: broker:29092 # 内部网络地址
-      INFLUXDB_URL: http://influxdb:8086
-      INFLUXDB_TOKEN: mytoken # 替换为 .env 文件中的变量或实际值
-      INFLUXDB_ORG: myorg # 替换为 .env 文件中的变量或实际值
-      INFLUXDB_BUCKET: mybucket # 替换为 .env 文件中的变量或实际值
+  # kafka-influx-service:
+  #   build: ./kafka-influx-service # 指向你的服务目录，其中包含 Dockerfile
+  #   restart: always
+  #   env_file:
+  #     - ./kafka-influx-service/.env # 如果 .env 文件也在服务目录里，相应调整路径
+  #   depends_on:
+  #     - broker
+  #   environment: # 确保这里有 Kafka 和 InfluxDB 连接信息
+  #     KAFKA_BOOTSTRAP_SERVERS: broker:29092 # 内部网络地址
+  #     INFLUXDB_URL: http://influxdb:8086
+  #     INFLUXDB_TOKEN: mytoken # 替换为 .env 文件中的变量或实际值
+  #     INFLUXDB_ORG: myorg # 替换为 .env 文件中的变量或实际值
+  #     INFLUXDB_BUCKET: mybucket # 替换为 .env 文件中的变量或实际值
 
 volumes:
   mongo-data:

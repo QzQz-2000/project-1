@@ -17,37 +17,6 @@ import time
 from collections import defaultdict
 import weakref
 
-# ==================== 实时更新架构概述 ====================
-"""
-实时Twin数据更新的核心挑战：
-
-1. 数据源多样性：
-   - MQTT设备上报
-   - HTTP API推送  
-   - 内部系统更新
-   - 批量数据导入
-
-2. 更新频率差异：
-   - 高频传感器数据（每秒多次）
-   - 低频状态数据（每分钟/小时）
-   - 事件驱动数据（不定期）
-
-3. 一致性要求：
-   - 多个副本同步
-   - 版本冲突处理
-   - 最终一致性保证
-
-4. 实时性要求：
-   - 毫秒级延迟
-   - 大量并发连接
-   - 推送通知机制
-
-解决方案架构：
-设备数据 → Kafka → TwinUpdateProcessor → Redis → WebSocket推送
-         ↓
-      批量持久化 → InfluxDB/PostgreSQL
-"""
-
 # ==================== 数据更新事件定义 ====================
 
 class UpdateType(Enum):

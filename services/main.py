@@ -30,16 +30,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
 from fastapi import APIRouter
 
-# Pydantic 配置
 from pydantic import BaseModel, Field, validator
 from pydantic_settings import BaseSettings
-
-# 数据库驱动
 from pymongo.errors import DuplicateKeyError
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
 from pymongo import DESCENDING, IndexModel
-from neo4j import AsyncGraphDatabase
-from neo4j.exceptions import Neo4jError
 from influxdb_client import InfluxDBClient
 from influxdb_client.client.write_api import SYNCHRONOUS
 from aiokafka import AIOKafkaProducer
@@ -48,22 +43,18 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# 配置日志
+# set to INFO
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# --- Settings ---
+# settings
 class Settings(BaseSettings):
     # Database connections
     MONGO_URI: str = Field(default="mongodb://localhost:27017")
     MONGO_DB_NAME: str = Field(default="digital_twin_db")
-    
-    NEO4J_URI: str = Field(default="bolt://localhost:7687")
-    NEO4J_USER: str = Field(default="neo4j")
-    NEO4J_PASSWORD: str = Field(default="password")
     
     KAFKA_BROKER: str = Field(default="localhost:9092")
     
@@ -72,11 +63,9 @@ class Settings(BaseSettings):
     INFLUXDB_ORG: str = Field(default="myorg")
     INFLUXDB_BUCKET: str = Field(default="mybucket")
     
-    # API settings
     API_TITLE: str = Field(default="Digital Twin Platform API")
-    API_VERSION: str = Field(default="0.2.0")
+    API_VERSION: str = Field(default="0.3.0")
     
-    # Performance settings
     DEFAULT_PAGE_SIZE: int = Field(default=100)
     MAX_PAGE_SIZE: int = Field(default=1000)
     
@@ -95,19 +84,18 @@ class TimestampMixin(BaseModel):
     class Config:
         json_encoders = {
             datetime: lambda v: v.isoformat() + "Z"
-        }
+        } 
         populate_by_name = True
 
     def model_dump_mongo(self, **kwargs) -> Dict[str, Any]:
         """Convert model to MongoDB-compatible dictionary."""
         data = self.model_dump(**kwargs)
-        # Ensure datetime fields are properly formatted
+        # ensure datetime fields are properly formatted
         for field in ['created_at', 'updated_at', 'last_executed', 'telemetry_last_updated']:
             if field in data and isinstance(data[field], datetime):
                 data[field] = data[field].isoformat() + "Z"
         return data
 
-# --- Utility Functions ---
 def remove_mongo_id(data: Dict[str, Any]) -> Dict[str, Any]:
     """Remove MongoDB _id field from dictionary."""
     return {k: v for k, v in data.items() if k != '_id'}
@@ -120,6 +108,8 @@ def validate_identifier(identifier: str, field_name: str) -> str:
         raise ValueError(f"{field_name} must be between 3 and 50 characters")
     return identifier
 
+
+# Properties
 class PropertyType(str, Enum):
     STRING = "string"
     NUMBER = "number"
@@ -127,28 +117,14 @@ class PropertyType(str, Enum):
     OBJECT = "object"
     ARRAY = "array"
 
-# TODO: workflow的要不要在这定义还待定
-class WorkflowStatus(str, Enum):
-    ACTIVE = "active"
-    INACTIVE = "inactive"
-    ERROR = "error"
-    DRAFT = "draft"
-
-class WorkflowType(str, Enum):
-    AUTOMATION = "automation"
-    DATA_PROCESSING = "data_processing"
-    MONITORING = "monitoring"
-    CUSTOM = "custom"
-
-# TODO: 是否保留限制条件待定
 class PropertyDefinition(BaseModel):
     type: PropertyType
     unit: Optional[str] = None
     description: Optional[str] = None
     is_required: bool = False
     default_value: Optional[Any] = None
-    constraints: Optional[Dict[str, Any]] = None  # min, max, pattern, etc.
 
+# Environment
 class EnvironmentCreate(BaseModel):
     environment_id: str
     display_name: str
@@ -167,6 +143,7 @@ class Environment(TimestampMixin):
     display_name: str
     description: Optional[str] = None
 
+# Model - 定义twin的模板和属性结构
 class ModelCreate(BaseModel):
     model_id: str
     display_name: str
@@ -178,7 +155,9 @@ class ModelCreate(BaseModel):
         return validate_identifier(v, 'model_id')
 
 class ModelUpdate(BaseModel):
+    display_name: Optional[str] = None
     description: Optional[str] = None
+    properties: Optional[Dict[str, PropertyDefinition]] = None
 
 class Model(TimestampMixin):
     model_id: str
@@ -187,31 +166,14 @@ class Model(TimestampMixin):
     description: Optional[str] = None
     properties: Dict[str, PropertyDefinition] = Field(default_factory=dict)
 
-class TwinCreate(BaseModel):
-    twin_id: str
-    model_id: str
-    properties: Optional[Dict[str, Any]] = Field(default_factory=dict)
-    
-    @validator('twin_id')
-    def validate_twin_id(cls, v):
-        return validate_identifier(v, 'twin_id')
-
-# TODO: twin
-class TwinUpdate(BaseModel):
-    properties: Optional[Dict[str, Any]] = None
-    telemetry_last_updated: Optional[datetime] = None
-
-class Twin(TimestampMixin):
-    twin_id: str
-    environment_id: str
-    model_id: str
-    properties: Dict[str, Any] = Field(default_factory=dict)
-    telemetry_last_updated: Optional[datetime] = None
-
+# Device - 仅存储设备基本信息，不存储属性
 class DeviceCreate(BaseModel):
     device_id: str
     display_name: str
     description: Optional[str] = None
+    device_type: Optional[str] = None  # 设备类型，如sensor, actuator, gateway
+    location: Optional[str] = None     # 设备位置
+    manufacturer: Optional[str] = None # 制造商
     
     @validator('device_id')
     def validate_device_id(cls, v):
@@ -220,20 +182,68 @@ class DeviceCreate(BaseModel):
 class DeviceUpdate(BaseModel):
     display_name: Optional[str] = None
     description: Optional[str] = None
+    device_type: Optional[str] = None
+    location: Optional[str] = None
+    manufacturer: Optional[str] = None
 
 class Device(TimestampMixin):
     device_id: str
     environment_id: str
     display_name: str
     description: Optional[str] = None
-    properties: Dict[str, Any] = Field(default_factory=dict)
-    # Statistics
+    device_type: Optional[str] = None
+    location: Optional[str] = None
+    manufacturer: Optional[str] = None
     telemetry_points_count: int = 0
 
+# Twin - model的实例，包含属性值
+class TwinCreate(BaseModel):
+    twin_id: str
+    model_id: str
+    display_name: Optional[str] = None
+    properties: Optional[Dict[str, Any]] = Field(default_factory=dict)
+    
+    @validator('twin_id')
+    def validate_twin_id(cls, v):
+        return validate_identifier(v, 'twin_id')
+
+class TwinUpdate(BaseModel):
+    display_name: Optional[str] = None
+    properties: Optional[Dict[str, Any]] = None
+    telemetry_last_updated: Optional[datetime] = None
+
+class Twin(TimestampMixin):
+    twin_id: str
+    environment_id: str
+    model_id: str
+    display_name: Optional[str] = None
+    properties: Dict[str, Any] = Field(default_factory=dict)
+    telemetry_last_updated: Optional[datetime] = None
+
+# Device-Twin Mapping - 维护设备和twin的关联关系
+class DeviceTwinMappingCreate(BaseModel):
+    device_id: str
+    twin_id: str
+    mapping_type: str = "direct"  # direct, indirect, virtual
+    description: Optional[str] = None
+
+class DeviceTwinMappingUpdate(BaseModel):
+    mapping_type: Optional[str] = None
+    description: Optional[str] = None
+
+class DeviceTwinMapping(TimestampMixin):
+    device_id: str
+    twin_id: str
+    environment_id: str
+    mapping_type: str = "direct"
+    description: Optional[str] = None
+
+# Relationship - twin之间的关系
 class RelationshipCreate(BaseModel):
     source_twin_id: str
     target_twin_id: str
     relationship_name: str
+    properties: Optional[Dict[str, Any]] = Field(default_factory=dict)
     
     @validator('relationship_name')
     def validate_relationship_name(cls, v):
@@ -241,65 +251,29 @@ class RelationshipCreate(BaseModel):
             raise ValueError("Relationship name must contain only letters, numbers, and underscores, and start with a letter")
         return v
 
+class RelationshipUpdate(BaseModel):
+    properties: Optional[Dict[str, Any]] = None
+
 class Relationship(TimestampMixin):
     source_twin_id: str
     target_twin_id: str
     relationship_name: str
     environment_id: str
+    properties: Dict[str, Any] = Field(default_factory=dict)
 
-class WorkflowCreate(BaseModel):
-    workflow_id: str
-    file_name: str
-    content: str
-    workflow_type: WorkflowType = WorkflowType.CUSTOM
-    description: Optional[str] = None
-    tags: List[str] = Field(default_factory=list)
-    
-    @validator('workflow_id')
-    def validate_workflow_id(cls, v):
-        return validate_identifier(v, 'workflow_id')
+# 前端树状图数据结构
+class TreeNode(BaseModel):
+    id: str
+    label: str
+    type: str  # "twin", "device"
+    children: List['TreeNode'] = Field(default_factory=list)
+    metadata: Optional[Dict[str, Any]] = None
 
-class WorkflowUpdate(BaseModel):
-    file_name: Optional[str] = None
-    content: Optional[str] = None
-    workflow_type: Optional[WorkflowType] = None
-    status: Optional[WorkflowStatus] = None
-    description: Optional[str] = None
-    tags: Optional[List[str]] = None
-    version: Optional[str] = None
+TreeNode.model_rebuild()  # 解决前向引用问题
 
-class Workflow(TimestampMixin):
-    workflow_id: str
-    environment_id: str
-    file_name: str
-    content: str
-    workflow_type: WorkflowType = WorkflowType.CUSTOM
-    status: WorkflowStatus = WorkflowStatus.DRAFT
-    description: Optional[str] = None
-    version: str = "1.0.0"
-    tags: List[str] = Field(default_factory=list)
-    # Execution statistics
-    last_executed: Optional[datetime] = None
-    execution_count: int = 0
-    # Metadata
-    file_size: int = 0
-    checksum: str = ""
-
-class WorkflowSummary(BaseModel):
-    """Workflow summary for list views (without content)."""
-    workflow_id: str
-    environment_id: str
-    file_name: str
-    workflow_type: WorkflowType
-    status: WorkflowStatus
-    description: Optional[str] = None
-    version: str
-    tags: List[str]
-    created_at: datetime
-    updated_at: datetime
-    last_executed: Optional[datetime] = None
-    execution_count: int
-    file_size: int
+class TreeGraph(BaseModel):
+    nodes: List[TreeNode]
+    relationships: List[Relationship]
 
 # Response Models
 class PaginatedResponse(BaseModel, Generic[TypeVar('T')]):
@@ -347,7 +321,6 @@ class DatabaseClients:
     def __init__(self):
         self.mongo_client: Optional[AsyncIOMotorClient] = None
         self.mongo_db: Optional[AsyncIOMotorDatabase] = None
-        self.neo4j_driver: Optional[AsyncGraphDatabase] = None
         self.kafka_producer: Optional[AIOKafkaProducer] = None
         self.influxdb_client: Optional[InfluxDBClient] = None
         
@@ -362,17 +335,6 @@ class DatabaseClients:
             
             # Create indexes
             await self._create_mongodb_indexes()
-            
-            # Neo4j
-            self.neo4j_driver = AsyncGraphDatabase.driver(
-                settings.NEO4J_URI,
-                auth=(settings.NEO4J_USER, settings.NEO4J_PASSWORD)
-            )
-            await self.neo4j_driver.verify_connectivity()
-            logger.info("Connected to Neo4j")
-            
-            # Create constraints
-            await self._create_neo4j_constraints()
             
             # Kafka
             self.kafka_producer = AIOKafkaProducer(
@@ -399,8 +361,6 @@ class DatabaseClients:
         """Close all database connections."""
         if self.mongo_client:
             self.mongo_client.close()
-        if self.neo4j_driver:
-            await self.neo4j_driver.close()
         if self.kafka_producer:
             await self.kafka_producer.stop()
         if self.influxdb_client:
@@ -413,15 +373,19 @@ class DatabaseClients:
             (self.mongo_db["environments"], [IndexModel("environment_id", unique=True)]),
             # Models
             (self.mongo_db["models"], [IndexModel([("environment_id", 1), ("model_id", 1)], unique=True)]),
+            # Devices
+            (self.mongo_db["devices"], [IndexModel([("environment_id", 1), ("device_id", 1)], unique=True)]),
             # Twins
             (self.mongo_db["twins"], [
                 IndexModel([("environment_id", 1), ("twin_id", 1)], unique=True),
                 IndexModel([("environment_id", 1), ("model_id", 1)])
             ]),
-            # Devices
-            (self.mongo_db["devices"], [IndexModel([("environment_id", 1), ("device_id", 1)], unique=True)]),
-            # Workflows
-            (self.mongo_db["workflows"], [IndexModel([("environment_id", 1), ("workflow_id", 1)], unique=True)]),
+            # Device-Twin Mappings
+            (self.mongo_db["device_twin_mappings"], [
+                IndexModel([("environment_id", 1), ("device_id", 1), ("twin_id", 1)], unique=True),
+                IndexModel([("environment_id", 1), ("device_id", 1)]),
+                IndexModel([("environment_id", 1), ("twin_id", 1)])
+            ]),
             # Relationships
             (self.mongo_db["relationships"], [
                 IndexModel([
@@ -429,29 +393,15 @@ class DatabaseClients:
                     ("source_twin_id", 1),
                     ("target_twin_id", 1),
                     ("relationship_name", 1)
-                ], unique=True)
+                ], unique=True),
+                IndexModel([("environment_id", 1), ("source_twin_id", 1)]),
+                IndexModel([("environment_id", 1), ("target_twin_id", 1)])
             ])
         ]
         
         for collection, index_models in indexes:
             await collection.create_indexes(index_models)
         logger.info("MongoDB indexes created")
-    
-    async def _create_neo4j_constraints(self):
-        """Create Neo4j constraints."""
-        constraints = [
-            "CREATE CONSTRAINT twin_id_unique IF NOT EXISTS FOR (t:Twin) REQUIRE t.twin_id IS UNIQUE",
-            "CREATE INDEX twin_environment_id IF NOT EXISTS FOR (t:Twin) ON (t.environment_id)",
-            "CREATE INDEX twin_model_id IF NOT EXISTS FOR (t:Twin) ON (t.model_id)"
-        ]
-        
-        async with self.neo4j_driver.session() as session:
-            for constraint in constraints:
-                try:
-                    await session.run(constraint)
-                except Neo4jError as e:
-                    if "already exists" not in str(e):
-                        raise
 
 # --- Base Service Class ---
 class BaseService(ABC):
@@ -563,13 +513,13 @@ class EnvironmentService(BaseService):
         if not await self.check_environment_exists(environment_id):
             raise ResourceNotFoundError("Environment", environment_id)
         
-        # Delete all twins (this will cascade to Neo4j)
+        # Delete all twins (this will cascade to relationships)
         twin_ids = await self.db["twins"].distinct("twin_id", {"environment_id": environment_id})
         for twin_id in twin_ids:
             await self.twin_service.delete(environment_id, twin_id)
         
         # Delete other resources
-        collections_to_clean = ["devices", "models", "workflows", "relationships"]
+        collections_to_clean = ["devices", "models", "relationships", "device_twin_mappings"]
         for collection_name in collections_to_clean:
             result = await self.db[collection_name].delete_many({"environment_id": environment_id})
             if result.deleted_count > 0:
@@ -588,7 +538,7 @@ class EnvironmentService(BaseService):
         )
 
 class DeviceService(BaseService):
-    """Service for managing devices."""
+    """Service for managing devices - 仅存储基本信息."""
     
     collection_name = "devices"
     
@@ -637,7 +587,7 @@ class DeviceService(BaseService):
             has_next=skip + limit < total_count,
             has_previous=skip > 0
         )
-    # TODO: 待修改，是否需要增加schema
+    
     async def update(self, environment_id: str, device_id: str, data: DeviceUpdate) -> Device:
         """Update a device."""
         update_data = data.model_dump(exclude_unset=True)
@@ -658,6 +608,18 @@ class DeviceService(BaseService):
     
     async def delete(self, environment_id: str, device_id: str) -> OperationResponse:
         """Delete a device."""
+        # Check if device has mappings to twins
+        mapping_count = await self.db["device_twin_mappings"].count_documents({
+            "environment_id": environment_id,
+            "device_id": device_id
+        }, limit=1)
+        
+        if mapping_count > 0:
+            raise DependencyError(
+                f"Cannot delete device '{device_id}'. "
+                "There are twins mapped to this device. Please remove mappings first."
+            )
+        
         result = await self.collection.delete_one({
             "environment_id": environment_id,
             "device_id": device_id
@@ -671,7 +633,6 @@ class DeviceService(BaseService):
             success=True,
             message=f"Device '{device_id}' deleted successfully"
         )
-
 
 class ModelService(BaseService):
     """Service for managing models."""
@@ -771,15 +732,13 @@ class ModelService(BaseService):
         )
 
 class TwinService(BaseService):
-    """Service for managing digital twins."""
+    """Service for managing digital twins - model的实例."""
     
     collection_name = "twins"
     
-    def __init__(self, db: AsyncIOMotorDatabase, neo4j_driver: AsyncGraphDatabase):
+    def __init__(self, db: AsyncIOMotorDatabase):
         super().__init__(db)
-        self.neo4j_driver = neo4j_driver
 
-    # TODO: 是否需要验证
     async def validate_properties(self, environment_id: str, model_id: str, properties: Dict[str, Any]):
         """Validate twin properties against model definition."""
         model_doc = await self.db["models"].find_one({
@@ -815,16 +774,6 @@ class TwinService(BaseService):
                 raise ValidationError(f"Property '{prop_name}' must be a number")
             elif prop_def.type == PropertyType.BOOLEAN and not isinstance(prop_value, bool):
                 raise ValidationError(f"Property '{prop_name}' must be a boolean")
-            
-            # Constraint validation
-            if prop_def.constraints:
-                if "min" in prop_def.constraints and prop_value < prop_def.constraints["min"]:
-                    raise ValidationError(f"Property '{prop_name}' must be >= {prop_def.constraints['min']}")
-                if "max" in prop_def.constraints and prop_value > prop_def.constraints["max"]:
-                    raise ValidationError(f"Property '{prop_name}' must be <= {prop_def.constraints['max']}")
-                if "pattern" in prop_def.constraints and isinstance(prop_value, str):
-                    if not re.match(prop_def.constraints["pattern"], prop_value):
-                        raise ValidationError(f"Property '{prop_name}' does not match required pattern")
     
     async def create(self, environment_id: str, data: TwinCreate) -> Twin:
         """Create a new digital twin."""
@@ -846,29 +795,6 @@ class TwinService(BaseService):
         
         # Create in MongoDB
         await self.collection.insert_one(twin.model_dump_mongo())
-        
-        # Create in Neo4j
-        try:
-            async with self.neo4j_driver.session() as session:
-                await session.run(
-                    """
-                    CREATE (t:Twin {
-                        twin_id: $twin_id,
-                        environment_id: $environment_id,
-                        model_id: $model_id
-                    })
-                    """,
-                    twin_id=twin.twin_id,
-                    environment_id=twin.environment_id,
-                    model_id=twin.model_id)
-        except Exception as e:
-            # Rollback MongoDB operation
-            await self.collection.delete_one({"twin_id": data.twin_id, "environment_id": environment_id})
-            logger.error(f"Failed to create twin in Neo4j: {e}")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to create twin in graph database"
-            )
         
         logger.info(f"Created twin: {data.twin_id} in environment: {environment_id}")
         return twin
@@ -904,7 +830,6 @@ class TwinService(BaseService):
             has_previous=skip > 0
         )
     
-    # TODO: twin的update到底可以update什么
     async def update(self, environment_id: str, twin_id: str, data: TwinUpdate) -> Twin:
         """Update a twin."""
         # Get existing twin
@@ -942,28 +867,6 @@ class TwinService(BaseService):
         }, limit=1) > 0:
             raise ResourceNotFoundError("Twin", twin_id, environment_id)
         
-        # Delete from Neo4j (including relationships)
-        try:
-            async with self.neo4j_driver.session() as session:
-                result = await session.run(
-                    """
-                    MATCH (t:Twin {twin_id: $twin_id, environment_id: $environment_id})
-                    DETACH DELETE t
-                    RETURN count(t) AS deleted_count
-                    """,
-                    twin_id=twin_id,
-                    environment_id=environment_id
-                )
-                record = await result.single()
-                if record and record["deleted_count"] == 0:
-                    logger.warning(f"Twin {twin_id} not found in Neo4j")
-        except Exception as e:
-            logger.error(f"Failed to delete twin from Neo4j: {e}")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to delete twin from graph database"
-            )
-        
         # Delete from MongoDB
         result = await self.collection.delete_one({
             "environment_id": environment_id,
@@ -973,7 +876,7 @@ class TwinService(BaseService):
         if result.deleted_count == 0:
             raise ResourceNotFoundError("Twin", twin_id, environment_id)
         
-        # Also delete relationships from MongoDB
+        # Also delete relationships and mappings
         await self.db["relationships"].delete_many({
             "environment_id": environment_id,
             "$or": [
@@ -982,21 +885,151 @@ class TwinService(BaseService):
             ]
         })
         
+        await self.db["device_twin_mappings"].delete_many({
+            "environment_id": environment_id,
+            "twin_id": twin_id
+        })
+        
         logger.info(f"Deleted twin: {twin_id} from environment: {environment_id}")
         return OperationResponse(
             success=True,
             message=f"Twin '{twin_id}' and its relationships deleted successfully"
         )
 
+class DeviceTwinMappingService(BaseService):
+    """Service for managing device-twin mappings."""
+    
+    collection_name = "device_twin_mappings"
+    
+    async def create(self, environment_id: str, data: DeviceTwinMappingCreate) -> DeviceTwinMapping:
+        """Create a new device-twin mapping."""
+        # Check environment exists
+        if not await self.check_environment_exists(environment_id):
+            raise ResourceNotFoundError("Environment", environment_id)
+        
+        # Check device exists
+        if not await self.db["devices"].count_documents({
+            "environment_id": environment_id,
+            "device_id": data.device_id
+        }, limit=1) > 0:
+            raise ResourceNotFoundError("Device", data.device_id, environment_id)
+        
+        # Check twin exists
+        if not await self.db["twins"].count_documents({
+            "environment_id": environment_id,
+            "twin_id": data.twin_id
+        }, limit=1) > 0:
+            raise ResourceNotFoundError("Twin", data.twin_id, environment_id)
+        
+        # Check if mapping already exists
+        if await self.collection.count_documents({
+            "environment_id": environment_id,
+            "device_id": data.device_id,
+            "twin_id": data.twin_id
+        }, limit=1) > 0:
+            raise ResourceConflictError(
+                "Mapping",
+                f"between device '{data.device_id}' and twin '{data.twin_id}'",
+                environment_id
+            )
+        
+        mapping = DeviceTwinMapping(environment_id=environment_id, **data.model_dump())
+        await self.collection.insert_one(mapping.model_dump_mongo())
+        
+        logger.info(f"Created device-twin mapping: {data.device_id} -> {data.twin_id} in environment: {environment_id}")
+        return mapping
+    
+    async def get_by_device(self, environment_id: str, device_id: str) -> List[DeviceTwinMapping]:
+        """Get all mappings for a device."""
+        cursor = self.collection.find({
+            "environment_id": environment_id,
+            "device_id": device_id
+        }).sort("created_at", DESCENDING)
+        
+        return [DeviceTwinMapping(**remove_mongo_id(doc)) async for doc in cursor]
+    
+    async def get_by_twin(self, environment_id: str, twin_id: str) -> List[DeviceTwinMapping]:
+        """Get all mappings for a twin."""
+        cursor = self.collection.find({
+            "environment_id": environment_id,
+            "twin_id": twin_id
+        }).sort("created_at", DESCENDING)
+        
+        return [DeviceTwinMapping(**remove_mongo_id(doc)) async for doc in cursor]
+    
+    async def list(self, environment_id: str, skip: int = 0, limit: int = 100) -> PaginatedResponse[DeviceTwinMapping]:
+        """List all mappings in an environment."""
+        query = {"environment_id": environment_id}
+        total_count = await self.collection.count_documents(query)
+        
+        cursor = self.collection.find(query).sort("created_at", DESCENDING).skip(skip).limit(limit)
+        items = [DeviceTwinMapping(**remove_mongo_id(doc)) async for doc in cursor]
+        
+        return PaginatedResponse(
+            items=items,
+            total_count=total_count,
+            page=skip // limit + 1,
+            page_size=limit,
+            has_next=skip + limit < total_count,
+            has_previous=skip > 0
+        )
+    
+    async def update(self, environment_id: str, device_id: str, twin_id: str, data: DeviceTwinMappingUpdate) -> DeviceTwinMapping:
+        """Update a device-twin mapping."""
+        update_data = data.model_dump(exclude_unset=True)
+        if not update_data:
+            raise ValidationError("No fields to update")
+        
+        update_data["updated_at"] = datetime.utcnow()
+        
+        result = await self.collection.update_one(
+            {"environment_id": environment_id, "device_id": device_id, "twin_id": twin_id},
+            {"$set": update_data}
+        )
+        
+        if result.matched_count == 0:
+            raise ResourceNotFoundError(
+                "Mapping",
+                f"between device '{device_id}' and twin '{twin_id}'",
+                environment_id
+            )
+        
+        doc = await self.collection.find_one({
+            "environment_id": environment_id,
+            "device_id": device_id,
+            "twin_id": twin_id
+        })
+        return DeviceTwinMapping(**remove_mongo_id(doc))
+    
+    async def delete(self, environment_id: str, device_id: str, twin_id: str) -> OperationResponse:
+        """Delete a device-twin mapping."""
+        result = await self.collection.delete_one({
+            "environment_id": environment_id,
+            "device_id": device_id,
+            "twin_id": twin_id
+        })
+        
+        if result.deleted_count == 0:
+            raise ResourceNotFoundError(
+                "Mapping",
+                f"between device '{device_id}' and twin '{twin_id}'",
+                environment_id
+            )
+        
+        logger.info(f"Deleted device-twin mapping: {device_id} -> {twin_id} from environment: {environment_id}")
+        return OperationResponse(
+            success=True,
+            message=f"Mapping between device '{device_id}' and twin '{twin_id}' deleted successfully"
+        )
 
-class RelationshipService:
-    """Service for managing relationships between twins."""
+class RelationshipService(BaseService):
+    """Service for managing relationships between twins - 优化用于树状图显示."""
     
-    def __init__(self, db: AsyncIOMotorDatabase, neo4j_driver: AsyncGraphDatabase):
-        self.db = db
-        self.collection = db["relationships"]
-        self.neo4j_driver = neo4j_driver
+    collection_name = "relationships"
     
+    def __init__(self, db: AsyncIOMotorDatabase):
+        super().__init__(db)
+        
     async def create(self, environment_id: str, data: RelationshipCreate) -> Relationship:
         """Create a new relationship between twins."""
         # Validate twins exist
@@ -1020,48 +1053,15 @@ class RelationshipService:
                 f"{data.relationship_name} between {data.source_twin_id} and {data.target_twin_id}",
                 environment_id
             )
-        
-        #relationship = Relationship(environment_id=environment_id, **data.model_dump())
-        
-        # Create in MongoDB
-        # await self.collection.insert_one(relationship.model_dump_mongo())
-        
-        # Create in Neo4j
-        try:
-            async with self.neo4j_driver.session() as session:
-                query = f"""
-                MATCH (a:Twin {{twin_id: $source_twin_id, environment_id: $environment_id}})
-                MATCH (b:Twin {{twin_id: $target_twin_id, environment_id: $environment_id}})
-                CREATE (a)-[r:`{data.relationship_name}` {{
-                    environment_id: $environment_id
-                }}]->(b)
-                RETURN r
-                """
-                await session.run(
-                    query,
-                    source_twin_id=data.source_twin_id,
-                    target_twin_id=data.target_twin_id,
-                    environment_id=environment_id,
 
-                )
-        except Exception as e:
-            # # Rollback MongoDB operation
-            # await self.collection.delete_one({
-            #     "environment_id": environment_id,
-            #     "source_twin_id": data.source_twin_id,
-            #     "target_twin_id": data.target_twin_id,
-            #     "relationship_name": data.relationship_name
-            # })
-            logger.error(f"Failed to create relationship in Neo4j: {e}")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to create relationship in graph database"
-            )
+        # Create relationship object
+        relationship = Relationship(environment_id=environment_id, **data.model_dump())
         
+        # Store in MongoDB
+        await self.collection.insert_one(relationship.model_dump_mongo())
         logger.info(f"Created relationship: {data.relationship_name} in environment: {environment_id}")
         return relationship
     
-    # TODO：是否有必要有这个函数？
     async def get(self, environment_id: str, source_twin_id: str, 
                   target_twin_id: str, relationship_name: str) -> Relationship:
         """Get a specific relationship."""
@@ -1103,233 +1103,194 @@ class RelationshipService:
             has_previous=skip > 0
         )
     
+    async def update(self, environment_id: str, source_twin_id: str,
+                     target_twin_id: str, relationship_name: str, 
+                     data: RelationshipUpdate) -> Relationship:
+        """Update relationship properties."""
+        update_data = data.model_dump(exclude_unset=True)
+        if not update_data:
+            raise ValidationError("No fields to update")
+        
+        update_data["updated_at"] = datetime.utcnow()
+        
+        result = await self.collection.update_one(
+            {
+                "environment_id": environment_id,
+                "source_twin_id": source_twin_id,
+                "target_twin_id": target_twin_id,
+                "relationship_name": relationship_name
+            },
+            {"$set": update_data}
+        )
+        
+        if result.matched_count == 0:
+            raise ResourceNotFoundError(
+                "Relationship",
+                f"{relationship_name} between {source_twin_id} and {target_twin_id}",
+                environment_id
+            )
+        
+        return await self.get(environment_id, source_twin_id, target_twin_id, relationship_name)
+    
     async def delete(self, environment_id: str, source_twin_id: str,
                      target_twin_id: str, relationship_name: str) -> OperationResponse:
         """Delete a relationship."""
-        # Delete from Neo4j
-        try:
-            async with self.neo4j_driver.session() as session:
-                query = f"""
-                MATCH (a:Twin {{twin_id: $source_twin_id, environment_id: $environment_id}})
-                      -[r:`{relationship_name}`]->
-                      (b:Twin {{twin_id: $target_twin_id, environment_id: $environment_id}})
-                DELETE r
-                RETURN count(r) AS deleted_count
-                """
-                result = await session.run(
-                    query,
-                    source_twin_id=source_twin_id,
-                    target_twin_id=target_twin_id,
-                    environment_id=environment_id
-                )
-                record = await result.single()
-                if record and record["deleted_count"] == 0:
-                    logger.warning(f"Relationship not found in Neo4j")
-        except Exception as e:
-            logger.error(f"Failed to delete relationship from Neo4j: {e}")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to delete relationship from graph database"
+        result = await self.collection.delete_one({
+            "environment_id": environment_id,
+            "source_twin_id": source_twin_id,
+            "target_twin_id": target_twin_id,
+            "relationship_name": relationship_name
+        })
+        
+        if result.deleted_count == 0:
+            raise ResourceNotFoundError(
+                "Relationship",
+                f"{relationship_name} between {source_twin_id} and {target_twin_id}",
+                environment_id
             )
-        
-        # # Delete from MongoDB
-        # result = await self.collection.delete_one({
-        #     "environment_id": environment_id,
-        #     "source_twin_id": source_twin_id,
-        #     "target_twin_id": target_twin_id,
-        #     "relationship_name": relationship_name
-        # })
-        
-        # if result.deleted_count == 0:
-        #     raise ResourceNotFoundError(
-        #         "Relationship",
-        #         f"{relationship_name} between {source_twin_id} and {target_twin_id}",
-        #         environment_id
-        #     )
         
         logger.info(f"Deleted relationship: {relationship_name} from environment: {environment_id}")
         return OperationResponse(
             success=True,
             message=f"Relationship '{relationship_name}' deleted successfully"
         )
-
-class WorkflowService(BaseService):
-    """Service for managing workflows."""
     
-    collection_name = "workflows"
-    
-    def validate_yaml_content(self, content: str) -> Dict[str, Any]:
-        """Validate and parse YAML content."""
-        try:
-            yaml_data = yaml.safe_load(content)
-            if yaml_data is None:
-                raise ValidationError("YAML content is empty")
-            if not isinstance(yaml_data, dict):
-                raise ValidationError("YAML content must be a dictionary")
-            return yaml_data
-        except yaml.YAMLError as e:
-            raise ValidationError(f"Invalid YAML syntax: {e}")
-    
-    def calculate_checksum(self, content: str) -> str:
-        """Calculate SHA256 checksum of content."""
-        return hashlib.sha256(content.encode('utf-8')).hexdigest()
-    
-    async def create(self, environment_id: str, data: WorkflowCreate) -> Workflow:
-        """Create a new workflow."""
-        # Check environment exists
-        if not await self.check_environment_exists(environment_id):
-            raise ResourceNotFoundError("Environment", environment_id)
+    async def get_tree_graph(self, environment_id: str, root_twin_id: Optional[str] = None) -> TreeGraph:
+        """获取用于前端树状图显示的数据结构."""
         
-        # Check if workflow already exists
-        if await self.collection.count_documents({
-            "environment_id": environment_id,
-            "workflow_id": data.workflow_id
-        }, limit=1) > 0:
-            raise ResourceConflictError("Workflow", data.workflow_id, environment_id)
+        # 获取所有relationships
+        cursor = self.collection.find({"environment_id": environment_id})
+        relationships = [Relationship(**remove_mongo_id(doc)) async for doc in cursor]
         
-        # Validate YAML content
-        self.validate_yaml_content(data.content)
+        # 获取所有twins的基本信息
+        twins_cursor = self.db["twins"].find({"environment_id": environment_id})
+        twins_dict = {}
+        async for doc in twins_cursor:
+            twin = Twin(**remove_mongo_id(doc))
+            twins_dict[twin.twin_id] = twin
         
-        workflow = Workflow(
-            environment_id=environment_id,
-            **data.model_dump(),
-            file_size=len(data.content.encode('utf-8')),
-            checksum=self.calculate_checksum(data.content)
-        )
+        # 构建树状结构
+        if not relationships:
+            # 如果没有关系，返回所有twins作为根节点
+            nodes = []
+            for twin_id, twin in twins_dict.items():
+                nodes.append(TreeNode(
+                    id=twin_id,
+                    label=twin.display_name or twin_id,
+                    type="twin",
+                    metadata={
+                        "model_id": twin.model_id,
+                        "properties": twin.properties,
+                        "created_at": twin.created_at.isoformat() if twin.created_at else None
+                    }
+                ))
+            return TreeGraph(nodes=nodes, relationships=relationships)
         
-        await self.collection.insert_one(workflow.model_dump_mongo())
+        # 构建邻接表
+        children_map = {}
+        parents_map = {}
         
-        logger.info(f"Created workflow: {data.workflow_id} in environment: {environment_id}")
-        return workflow
-    
-    async def upload(self, environment_id: str, workflow_id: str, 
-                     file_name: str, content: bytes) -> Workflow:
-        """Upload a workflow from file."""
-        # Decode content
-        try:
-            yaml_content = content.decode('utf-8')
-        except UnicodeDecodeError:
-            raise ValidationError("File content is not valid UTF-8")
+        for rel in relationships:
+            if rel.source_twin_id not in children_map:
+                children_map[rel.source_twin_id] = []
+            children_map[rel.source_twin_id].append(rel.target_twin_id)
+            parents_map[rel.target_twin_id] = rel.source_twin_id
         
-        # Create workflow
-        data = WorkflowCreate(
-            workflow_id=workflow_id,
-            file_name=file_name,
-            content=yaml_content
-        )
+        # 找到根节点（没有父节点的节点）
+        root_nodes = []
+        for twin_id in twins_dict.keys():
+            if twin_id not in parents_map:
+                root_nodes.append(twin_id)
         
-        return await self.create(environment_id, data)
-    
-    async def get(self, environment_id: str, workflow_id: str) -> Workflow:
-        """Get a workflow by ID."""
-        doc = await self.collection.find_one({
-            "environment_id": environment_id,
-            "workflow_id": workflow_id
-        })
-        if not doc:
-            raise ResourceNotFoundError("Workflow", workflow_id, environment_id)
-        return Workflow(**remove_mongo_id(doc))
-    
-    async def list(self, environment_id: str, status: Optional[WorkflowStatus] = None,
-                   workflow_type: Optional[WorkflowType] = None,
-                   skip: int = 0, limit: int = 100) -> PaginatedResponse[WorkflowSummary]:
-        """List workflows in an environment."""
-        query = {"environment_id": environment_id}
-        if status:
-            query["status"] = status.value
-        if workflow_type:
-            query["workflow_type"] = workflow_type.value
+        # 如果指定了root_twin_id，使用它作为唯一根节点
+        if root_twin_id and root_twin_id in twins_dict:
+            root_nodes = [root_twin_id]
         
-        total_count = await self.collection.count_documents(query)
-        
-        cursor = self.collection.find(query).sort("created_at", DESCENDING).skip(skip).limit(limit)
-        
-        # Convert to summaries (without content)
-        items = []
-        async for doc in cursor:
-            workflow = Workflow(**remove_mongo_id(doc))
-            summary = WorkflowSummary(
-                workflow_id=workflow.workflow_id,
-                environment_id=workflow.environment_id,
-                file_name=workflow.file_name,
-                workflow_type=workflow.workflow_type,
-                status=workflow.status,
-                description=workflow.description,
-                version=workflow.version,
-                tags=workflow.tags,
-                created_at=workflow.created_at,
-                updated_at=workflow.updated_at,
-                last_executed=workflow.last_executed,
-                execution_count=workflow.execution_count,
-                file_size=workflow.file_size
+        def build_tree_node(twin_id: str, visited: set) -> Optional[TreeNode]:
+            if twin_id in visited:
+                return None  # 避免循环引用
+            
+            visited.add(twin_id)
+            twin = twins_dict.get(twin_id)
+            if not twin:
+                return None
+            
+            node = TreeNode(
+                id=twin_id,
+                label=twin.display_name or twin_id,
+                type="twin",
+                metadata={
+                    "model_id": twin.model_id,
+                    "properties": twin.properties,
+                    "created_at": twin.created_at.isoformat() if twin.created_at else None
+                }
             )
-            items.append(summary)
+            
+            # 递归构建子节点
+            children = children_map.get(twin_id, [])
+            for child_id in children:
+                child_node = build_tree_node(child_id, visited.copy())
+                if child_node:
+                    node.children.append(child_node)
+            
+            return node
         
-        return PaginatedResponse(
-            items=items,
-            total_count=total_count,
-            page=skip // limit + 1,
-            page_size=limit,
-            has_next=skip + limit < total_count,
-            has_previous=skip > 0
-        )
+        # 构建树
+        tree_nodes = []
+        for root_id in root_nodes:
+            root_node = build_tree_node(root_id, set())
+            if root_node:
+                tree_nodes.append(root_node)
+        
+        return TreeGraph(nodes=tree_nodes, relationships=relationships)
     
-    async def update(self, environment_id: str, workflow_id: str, data: WorkflowUpdate) -> Workflow:
-        """Update a workflow."""
-        update_data = data.model_dump(exclude_unset=True)
-        if not update_data:
-            raise ValidationError("No fields to update")
+    async def get_statistics(self, environment_id: str) -> Dict[str, Any]:
+        """Get relationship statistics for an environment."""
+        pipeline = [
+            {"$match": {"environment_id": environment_id}},
+            {
+                "$group": {
+                    "_id": None,
+                    "total_relationships": {"$sum": 1},
+                    "unique_twins": {
+                        "$addToSet": {
+                            "$setUnion": [
+                                ["$source_twin_id"],
+                                ["$target_twin_id"]
+                            ]
+                        }
+                    },
+                    "relationship_types": {"$addToSet": "$relationship_name"}
+                }
+            },
+            {
+                "$project": {
+                    "total_relationships": 1,
+                    "unique_twins_count": {"$size": {"$arrayElemAt": ["$unique_twins", 0]}},
+                    "relationship_types_count": {"$size": "$relationship_types"},
+                    "relationship_types": 1
+                }
+            }
+        ]
         
-        # If updating content, validate and update metadata
-        if "content" in update_data:
-            self.validate_yaml_content(update_data["content"])
-            update_data["file_size"] = len(update_data["content"].encode('utf-8'))
-            update_data["checksum"] = self.calculate_checksum(update_data["content"])
+        cursor = self.collection.aggregate(pipeline)
+        result = await cursor.to_list(length=1)
         
-        update_data["updated_at"] = datetime.utcnow()
-        
-        result = await self.collection.update_one(
-            {"environment_id": environment_id, "workflow_id": workflow_id},
-            {"$set": update_data}
-        )
-        
-        if result.matched_count == 0:
-            raise ResourceNotFoundError("Workflow", workflow_id, environment_id)
-        
-        return await self.get(environment_id, workflow_id)
-    
-    async def delete(self, environment_id: str, workflow_id: str) -> OperationResponse:
-        """Delete a workflow."""
-        result = await self.collection.delete_one({
-            "environment_id": environment_id,
-            "workflow_id": workflow_id
-        })
-        
-        if result.deleted_count == 0:
-            raise ResourceNotFoundError("Workflow", workflow_id, environment_id)
-        
-        logger.info(f"Deleted workflow: {workflow_id} from environment: {environment_id}")
-        return OperationResponse(
-            success=True,
-            message=f"Workflow '{workflow_id}' deleted successfully"
-        )
-    
-    async def activate(self, environment_id: str, workflow_id: str) -> Workflow:
-        """Activate a workflow."""
-        return await self.update(
-            environment_id,
-            workflow_id,
-            WorkflowUpdate(status=WorkflowStatus.ACTIVE)
-        )
-    
-    async def deactivate(self, environment_id: str, workflow_id: str) -> Workflow:
-        """Deactivate a workflow."""
-        return await self.update(
-            environment_id,
-            workflow_id,
-            WorkflowUpdate(status=WorkflowStatus.INACTIVE)
-        )
-
+        if result:
+            stats = result[0]
+            return {
+                "total_relationships": stats.get("total_relationships", 0),
+                "unique_twins_count": stats.get("unique_twins_count", 0),
+                "relationship_types_count": stats.get("relationship_types_count", 0),
+                "relationship_types": stats.get("relationship_types", [])
+            }
+        else:
+            return {
+                "total_relationships": 0,
+                "unique_twins_count": 0,
+                "relationship_types_count": 0,
+                "relationship_types": []
+            }
 
 app = FastAPI(
     title=settings.API_TITLE,
@@ -1367,10 +1328,6 @@ def get_db() -> AsyncIOMotorDatabase:
     """Get MongoDB database instance."""
     return db_clients.mongo_db
 
-def get_neo4j_driver() -> AsyncGraphDatabase:
-    """Get Neo4j driver instance."""
-    return db_clients.neo4j_driver
-
 def get_kafka_producer() -> AIOKafkaProducer:
     """Get Kafka producer instance."""
     return db_clients.kafka_producer
@@ -1381,10 +1338,9 @@ def get_influxdb_client() -> InfluxDBClient:
 
 # Service dependencies
 async def get_twin_service(
-    db: AsyncIOMotorDatabase = Depends(get_db),
-    neo4j_driver: AsyncGraphDatabase = Depends(get_neo4j_driver)
+    db: AsyncIOMotorDatabase = Depends(get_db)
 ) -> TwinService:
-    return TwinService(db, neo4j_driver)
+    return TwinService(db)
 
 async def get_environment_service(
     db: AsyncIOMotorDatabase = Depends(get_db),
@@ -1398,14 +1354,16 @@ async def get_model_service(db: AsyncIOMotorDatabase = Depends(get_db)) -> Model
 async def get_device_service(db: AsyncIOMotorDatabase = Depends(get_db)) -> DeviceService:
     return DeviceService(db)
 
-async def get_relationship_service(
-    db: AsyncIOMotorDatabase = Depends(get_db),
-    neo4j_driver: AsyncGraphDatabase = Depends(get_neo4j_driver)
-) -> RelationshipService:
-    return RelationshipService(db, neo4j_driver)
+async def get_device_twin_mapping_service(
+    db: AsyncIOMotorDatabase = Depends(get_db)
+) -> DeviceTwinMappingService:
+    return DeviceTwinMappingService(db)
 
-async def get_workflow_service(db: AsyncIOMotorDatabase = Depends(get_db)) -> WorkflowService:
-    return WorkflowService(db)
+async def get_relationship_service(
+    db: AsyncIOMotorDatabase = Depends(get_db)
+) -> RelationshipService:
+    return RelationshipService(db)
+
 
 # --- API Routes ---
 # Environment endpoints
@@ -1499,7 +1457,55 @@ async def delete_model(
     """Delete a model. Fails if twins exist using this model."""
     return await service.delete(environment_id, model_id)
 
-# Twin endpoints
+# Device endpoints (仅存储基本信息)
+@app.post("/environments/{environment_id}/devices", response_model=Device, status_code=status.HTTP_201_CREATED, tags=["Devices"])
+async def create_device(
+    environment_id: str = Path(..., description="Environment identifier"),
+    data: DeviceCreate = Body(...),
+    service: DeviceService = Depends(get_device_service)
+):
+    """Create a new device."""
+    return await service.create(environment_id, data)
+
+@app.get("/environments/{environment_id}/devices", response_model=PaginatedResponse[Device], tags=["Devices"])
+async def list_devices(
+    environment_id: str = Path(..., description="Environment identifier"),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(settings.DEFAULT_PAGE_SIZE, ge=1, le=settings.MAX_PAGE_SIZE),
+    service: DeviceService = Depends(get_device_service)
+):
+    """List all devices in an environment."""
+    return await service.list(environment_id, skip, limit)
+
+@app.get("/environments/{environment_id}/devices/{device_id}", response_model=Device, tags=["Devices"])
+async def get_device(
+    environment_id: str = Path(..., description="Environment identifier"),
+    device_id: str = Path(..., description="Device identifier"),
+    service: DeviceService = Depends(get_device_service)
+):
+    """Get a specific device."""
+    return await service.get(environment_id, device_id)
+
+@app.put("/environments/{environment_id}/devices/{device_id}", response_model=Device, tags=["Devices"])
+async def update_device(
+    environment_id: str = Path(..., description="Environment identifier"),
+    device_id: str = Path(..., description="Device identifier"),
+    data: DeviceUpdate = Body(...),
+    service: DeviceService = Depends(get_device_service)
+):
+    """Update a device."""
+    return await service.update(environment_id, device_id, data)
+
+@app.delete("/environments/{environment_id}/devices/{device_id}", response_model=OperationResponse, tags=["Devices"])
+async def delete_device(
+    environment_id: str = Path(..., description="Environment identifier"),
+    device_id: str = Path(..., description="Device identifier"),
+    service: DeviceService = Depends(get_device_service)
+):
+    """Delete a device."""
+    return await service.delete(environment_id, device_id)
+
+# Twin endpoints (model的实例，包含属性)
 @app.post("/environments/{environment_id}/twins", response_model=Twin, status_code=status.HTTP_201_CREATED, tags=["Twins"])
 async def create_twin(
     environment_id: str = Path(..., description="Environment identifier"),
@@ -1548,53 +1554,64 @@ async def delete_twin(
     """Delete a twin and its relationships."""
     return await service.delete(environment_id, twin_id)
 
-# Device endpoints
-@app.post("/environments/{environment_id}/devices", response_model=Device, status_code=status.HTTP_201_CREATED, tags=["Devices"])
-async def create_device(
+# Device-Twin Mapping endpoints
+@app.post("/environments/{environment_id}/mappings", response_model=DeviceTwinMapping, status_code=status.HTTP_201_CREATED, tags=["Device-Twin Mappings"])
+async def create_device_twin_mapping(
     environment_id: str = Path(..., description="Environment identifier"),
-    data: DeviceCreate = Body(...),
-    service: DeviceService = Depends(get_device_service)
+    data: DeviceTwinMappingCreate = Body(...),
+    service: DeviceTwinMappingService = Depends(get_device_twin_mapping_service)
 ):
-    """Create a new device."""
+    """Create a new device-twin mapping."""
     return await service.create(environment_id, data)
 
-@app.get("/environments/{environment_id}/devices", response_model=PaginatedResponse[Device], tags=["Devices"])
-async def list_devices(
+@app.get("/environments/{environment_id}/mappings", response_model=PaginatedResponse[DeviceTwinMapping], tags=["Device-Twin Mappings"])
+async def list_device_twin_mappings(
     environment_id: str = Path(..., description="Environment identifier"),
     skip: int = Query(0, ge=0),
     limit: int = Query(settings.DEFAULT_PAGE_SIZE, ge=1, le=settings.MAX_PAGE_SIZE),
-    service: DeviceService = Depends(get_device_service)
+    service: DeviceTwinMappingService = Depends(get_device_twin_mapping_service)
 ):
-    """List all devices in an environment."""
+    """List all device-twin mappings in an environment."""
     return await service.list(environment_id, skip, limit)
 
-@app.get("/environments/{environment_id}/devices/{device_id}", response_model=Device, tags=["Devices"])
-async def get_device(
+@app.get("/environments/{environment_id}/mappings/device/{device_id}", response_model=List[DeviceTwinMapping], tags=["Device-Twin Mappings"])
+async def get_device_mappings(
     environment_id: str = Path(..., description="Environment identifier"),
     device_id: str = Path(..., description="Device identifier"),
-    service: DeviceService = Depends(get_device_service)
+    service: DeviceTwinMappingService = Depends(get_device_twin_mapping_service)
 ):
-    """Get a specific device."""
-    return await service.get(environment_id, device_id)
+    """Get all mappings for a specific device."""
+    return await service.get_by_device(environment_id, device_id)
 
-@app.put("/environments/{environment_id}/devices/{device_id}", response_model=Device, tags=["Devices"])
-async def update_device(
+@app.get("/environments/{environment_id}/mappings/twin/{twin_id}", response_model=List[DeviceTwinMapping], tags=["Device-Twin Mappings"])
+async def get_twin_mappings(
     environment_id: str = Path(..., description="Environment identifier"),
-    device_id: str = Path(..., description="Device identifier"),
-    data: DeviceUpdate = Body(...),
-    service: DeviceService = Depends(get_device_service)
+    twin_id: str = Path(..., description="Twin identifier"),
+    service: DeviceTwinMappingService = Depends(get_device_twin_mapping_service)
 ):
-    """Update a device."""
-    return await service.update(environment_id, device_id, data)
+    """Get all mappings for a specific twin."""
+    return await service.get_by_twin(environment_id, twin_id)
 
-@app.delete("/environments/{environment_id}/devices/{device_id}", response_model=OperationResponse, tags=["Devices"])
-async def delete_device(
+@app.put("/environments/{environment_id}/mappings/{device_id}/{twin_id}", response_model=DeviceTwinMapping, tags=["Device-Twin Mappings"])
+async def update_device_twin_mapping(
     environment_id: str = Path(..., description="Environment identifier"),
     device_id: str = Path(..., description="Device identifier"),
-    service: DeviceService = Depends(get_device_service)
+    twin_id: str = Path(..., description="Twin identifier"),
+    data: DeviceTwinMappingUpdate = Body(...),
+    service: DeviceTwinMappingService = Depends(get_device_twin_mapping_service)
 ):
-    """Delete a device."""
-    return await service.delete(environment_id, device_id)
+    """Update a device-twin mapping."""
+    return await service.update(environment_id, device_id, twin_id, data)
+
+@app.delete("/environments/{environment_id}/mappings/{device_id}/{twin_id}", response_model=OperationResponse, tags=["Device-Twin Mappings"])
+async def delete_device_twin_mapping(
+    environment_id: str = Path(..., description="Environment identifier"),
+    device_id: str = Path(..., description="Device identifier"),
+    twin_id: str = Path(..., description="Twin identifier"),
+    service: DeviceTwinMappingService = Depends(get_device_twin_mapping_service)
+):
+    """Delete a device-twin mapping."""
+    return await service.delete(environment_id, device_id, twin_id)
 
 # Relationship endpoints
 @app.post("/environments/{environment_id}/relationships", response_model=Relationship, status_code=status.HTTP_201_CREATED, tags=["Relationships"])
@@ -1617,108 +1634,61 @@ async def list_relationships(
     """List relationships in an environment."""
     return await service.list(environment_id, twin_id, skip, limit)
 
-@app.get("/environments/{environment_id}/relationships/{source_twin_id}/{relationship_name}/{target_twin_id}", 
+@app.get("/environments/{environment_id}/relationships/{source_twin_id}/{target_twin_id}/{relationship_name}", 
          response_model=Relationship, tags=["Relationships"])
 async def get_relationship(
     environment_id: str = Path(..., description="Environment identifier"),
     source_twin_id: str = Path(..., description="Source twin identifier"),
-    relationship_name: str = Path(..., description="Relationship name"),
     target_twin_id: str = Path(..., description="Target twin identifier"),
+    relationship_name: str = Path(..., description="Relationship name"),
     service: RelationshipService = Depends(get_relationship_service)
 ):
     """Get a specific relationship."""
     return await service.get(environment_id, source_twin_id, target_twin_id, relationship_name)
 
-@app.delete("/environments/{environment_id}/relationships/{source_twin_id}/{relationship_name}/{target_twin_id}", 
+@app.put("/environments/{environment_id}/relationships/{source_twin_id}/{target_twin_id}/{relationship_name}", 
+         response_model=Relationship, tags=["Relationships"])
+async def update_relationship(
+    environment_id: str = Path(..., description="Environment identifier"),
+    source_twin_id: str = Path(..., description="Source twin identifier"),
+    target_twin_id: str = Path(..., description="Target twin identifier"),
+    relationship_name: str = Path(..., description="Relationship name"),
+    data: RelationshipUpdate = Body(...),
+    service: RelationshipService = Depends(get_relationship_service)
+):
+    """Update a relationship."""
+    return await service.update(environment_id, source_twin_id, target_twin_id, relationship_name, data)
+
+@app.delete("/environments/{environment_id}/relationships/{source_twin_id}/{target_twin_id}/{relationship_name}", 
             response_model=OperationResponse, tags=["Relationships"])
 async def delete_relationship(
     environment_id: str = Path(..., description="Environment identifier"),
     source_twin_id: str = Path(..., description="Source twin identifier"),
-    relationship_name: str = Path(..., description="Relationship name"),
     target_twin_id: str = Path(..., description="Target twin identifier"),
+    relationship_name: str = Path(..., description="Relationship name"),
     service: RelationshipService = Depends(get_relationship_service)
 ):
     """Delete a relationship."""
     return await service.delete(environment_id, source_twin_id, target_twin_id, relationship_name)
 
-# Workflow endpoints
-@app.post("/environments/{environment_id}/workflows", response_model=Workflow, status_code=status.HTTP_201_CREATED, tags=["Workflows"])
-async def create_workflow(
+# 树状图数据 endpoint
+@app.get("/environments/{environment_id}/tree-graph", response_model=TreeGraph, tags=["Visualization"])
+async def get_tree_graph(
     environment_id: str = Path(..., description="Environment identifier"),
-    data: WorkflowCreate = Body(...),
-    service: WorkflowService = Depends(get_workflow_service)
+    root_twin_id: Optional[str] = Query(None, description="Root twin ID for tree visualization"),
+    service: RelationshipService = Depends(get_relationship_service)
 ):
-    """Create a new workflow."""
-    return await service.create(environment_id, data)
+    """Get tree graph data for frontend visualization."""
+    return await service.get_tree_graph(environment_id, root_twin_id)
 
-@app.post("/environments/{environment_id}/workflows/upload", response_model=Workflow, status_code=status.HTTP_201_CREATED, tags=["Workflows"])
-async def upload_workflow(
+# 获取统计数据
+@app.get("/environments/{environment_id}/relationships/stats", response_model=Dict[str, Any], tags=["Relationships"])
+async def get_relationship_statistics(
     environment_id: str = Path(..., description="Environment identifier"),
-    workflow_id: str = Form(..., description="Workflow identifier"),
-    file: UploadFile = File(..., description="YAML workflow file"),
-    service: WorkflowService = Depends(get_workflow_service)
+    service: RelationshipService = Depends(get_relationship_service)
 ):
-    """Upload a workflow from a YAML file."""
-    content = await file.read()
-    return await service.upload(environment_id, workflow_id, file.filename, content)
-
-@app.get("/environments/{environment_id}/workflows", response_model=PaginatedResponse[WorkflowSummary], tags=["Workflows"])
-async def list_workflows(
-    environment_id: str = Path(..., description="Environment identifier"),
-    status: Optional[WorkflowStatus] = Query(None, description="Filter by status"),
-    workflow_type: Optional[WorkflowType] = Query(None, description="Filter by type"),
-    skip: int = Query(0, ge=0),
-    limit: int = Query(settings.DEFAULT_PAGE_SIZE, ge=1, le=settings.MAX_PAGE_SIZE),
-    service: WorkflowService = Depends(get_workflow_service)
-):
-    """List workflows in an environment."""
-    return await service.list(environment_id, status, workflow_type, skip, limit)
-
-@app.get("/environments/{environment_id}/workflows/{workflow_id}", response_model=Workflow, tags=["Workflows"])
-async def get_workflow(
-    environment_id: str = Path(..., description="Environment identifier"),
-    workflow_id: str = Path(..., description="Workflow identifier"),
-    service: WorkflowService = Depends(get_workflow_service)
-):
-    """Get a specific workflow with full content."""
-    return await service.get(environment_id, workflow_id)
-
-@app.put("/environments/{environment_id}/workflows/{workflow_id}", response_model=Workflow, tags=["Workflows"])
-async def update_workflow(
-    environment_id: str = Path(..., description="Environment identifier"),
-    workflow_id: str = Path(..., description="Workflow identifier"),
-    data: WorkflowUpdate = Body(...),
-    service: WorkflowService = Depends(get_workflow_service)
-):
-    """Update a workflow."""
-    return await service.update(environment_id, workflow_id, data)
-
-@app.delete("/environments/{environment_id}/workflows/{workflow_id}", response_model=OperationResponse, tags=["Workflows"])
-async def delete_workflow(
-    environment_id: str = Path(..., description="Environment identifier"),
-    workflow_id: str = Path(..., description="Workflow identifier"),
-    service: WorkflowService = Depends(get_workflow_service)
-):
-    """Delete a workflow."""
-    return await service.delete(environment_id, workflow_id)
-
-@app.post("/environments/{environment_id}/workflows/{workflow_id}/activate", response_model=Workflow, tags=["Workflows"])
-async def activate_workflow(
-    environment_id: str = Path(..., description="Environment identifier"),
-    workflow_id: str = Path(..., description="Workflow identifier"),
-    service: WorkflowService = Depends(get_workflow_service)
-):
-    """Activate a workflow."""
-    return await service.activate(environment_id, workflow_id)
-
-@app.post("/environments/{environment_id}/workflows/{workflow_id}/deactivate", response_model=Workflow, tags=["Workflows"])
-async def deactivate_workflow(
-    environment_id: str = Path(..., description="Environment identifier"),
-    workflow_id: str = Path(..., description="Workflow identifier"),
-    service: WorkflowService = Depends(get_workflow_service)
-):
-    """Deactivate a workflow."""
-    return await service.deactivate(environment_id, workflow_id)
+    """Get relationship statistics for an environment."""
+    return await service.get_statistics(environment_id)
 
 # Health check endpoint
 @app.get("/health", tags=["Health"])
