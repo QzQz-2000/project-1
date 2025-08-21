@@ -1,6 +1,6 @@
+
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
-  Download,
   Building,
   Database,
   Settings,
@@ -496,49 +496,6 @@ const formatDate = (dateString) => {
   }
 };
 
-// CSV下载功能
-const downloadCSV = (data, filename = 'workflow_result.csv') => {
-  if (!data || data.length === 0) {
-    alert('No data to download');
-    return;
-  }
-
-  // 获取所有列名
-  const headers = Object.keys(data[0]);
-  
-  // 构建CSV内容
-  const csvContent = [
-    // CSV头部
-    headers.join(','),
-    // CSV数据行
-    ...data.map(row => 
-      headers.map(header => {
-        const value = row[header];
-        // 处理包含逗号、引号或换行符的值
-        if (typeof value === 'string' && (value.includes(',') || value.includes('"') || value.includes('\n'))) {
-          return `"${value.replace(/"/g, '""')}"`;
-        }
-        return value;
-      }).join(',')
-    )
-  ].join('\n');
-
-  // 创建Blob并下载
-  const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-  const link = document.createElement('a');
-  
-  if (link.download !== undefined) {
-    const url = URL.createObjectURL(blob);
-    link.setAttribute('href', url);
-    link.setAttribute('download', filename);
-    link.style.visibility = 'hidden';
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    URL.revokeObjectURL(url);
-  }
-};
-
 // Workflow API service class
 class WorkflowAPI {
   static async request(endpoint, options = {}) {
@@ -594,10 +551,6 @@ class WorkflowAPI {
 
   static async getHealth() {
     return this.request('/health');
-  }
-
-  static async getWorkflowFinalResult(environmentId, workflowId) {
-    return this.request(`/environments/${environmentId}/workflows/${workflowId}/final-result`);
   }
 }
 
@@ -719,14 +672,10 @@ const WorkflowManager = ({ selectedEnvironment }) => {
   const [loading, setLoading] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [showCreateForm, setShowCreateForm] = useState(false);
-
-  const [showWorkflowDetailModal, setShowWorkflowDetailModal] = useState(false);
-  const [showFinalResultModal, setShowFinalResultModal] = useState(false);
-
+  const [showResultModal, setShowResultModal] = useState(false);
   const [selectedWorkflow, setSelectedWorkflow] = useState(null);
-  const [finalResultData, setFinalResultData] = useState(null);
+  const [selectedResult, setSelectedResult] = useState(null);
   const [error, setError] = useState(null);
-  const [loadingResult, setLoadingResult] = useState(false);
 
   // 简化的表单数据 - 只需要一个JSON字符串
   const [workflowFormData, setWorkflowFormData] = useState({
@@ -758,7 +707,7 @@ const WorkflowManager = ({ selectedEnvironment }) => {
 
   const loadWorkflows = async () => {
     if (!selectedEnvironment) return;
-
+    
     try {
       setLoading(true);
       const workflowsData = await WorkflowAPI.listWorkflows(selectedEnvironment.environment_id);
@@ -820,7 +769,7 @@ const WorkflowManager = ({ selectedEnvironment }) => {
         }
       ]
     };
-
+    
     setWorkflowFormData({
       workflowJson: JSON.stringify(exampleWorkflow, null, 2)
     });
@@ -871,16 +820,16 @@ const WorkflowManager = ({ selectedEnvironment }) => {
       const result = await WorkflowAPI.submitWorkflow(selectedEnvironment.environment_id, workflowData);
 
       setShowCreateForm(false);
-      setWorkflowFormData({
+      setWorkflowFormData({ 
         workflowJson: JSON.stringify({
           name: "",
           description: "",
           steps: []
         }, null, 2)
       });
-
+      
       alert(`Workflow submitted successfully! ID: ${result.workflow_id}`);
-
+      
       await loadWorkflows();
 
     } catch (err) {
@@ -893,7 +842,7 @@ const WorkflowManager = ({ selectedEnvironment }) => {
   const handleRefreshStatus = async (workflowId) => {
     try {
       const statusData = await WorkflowAPI.getWorkflowStatus(selectedEnvironment.environment_id, workflowId);
-
+      
       const updatedWorkflows = workflows.map(w => {
         if (w.workflow_id === workflowId) {
           return {
@@ -906,44 +855,40 @@ const WorkflowManager = ({ selectedEnvironment }) => {
         }
         return w;
       });
-
+      
       setWorkflows(updatedWorkflows);
     } catch (err) {
       console.error('Failed to refresh workflow status:', err);
     }
   };
 
-  const handleViewWorkflowDetails = async (workflow) => {
+  const handleViewResults = async (workflow) => {
     try {
       setSelectedWorkflow(workflow);
-      setShowWorkflowDetailModal(true);
+      setSelectedResult(null);
+      setShowResultModal(true);
+
+      if (workflow.tasks) {
+        const completedTasks = workflow.tasks.filter(t => t.status === 'completed');
+        if (completedTasks.length > 0) {
+          const lastTask = completedTasks[completedTasks.length - 1];
+          try {
+            const resultData = await WorkflowAPI.getTaskResult(
+              selectedEnvironment.environment_id, 
+              workflow.workflow_id, 
+              lastTask.name
+            );
+            setSelectedResult({
+              task_name: lastTask.name,
+              data: resultData
+            });
+          } catch (err) {
+            console.error('Failed to load task result:', err);
+          }
+        }
+      }
     } catch (err) {
-      console.error('Failed to view workflow details:', err);
-    }
-  };
-
-  // 新增：查看最终结果
-  const handleViewFinalResults = async (workflow) => {
-    try {
-      setLoadingResult(true);
-      setSelectedWorkflow(workflow);
-      setFinalResultData(null);
-      setShowFinalResultModal(true);
-
-      // 调用新的API端点获取最终结果
-      const resultData = await WorkflowAPI.getWorkflowFinalResult(
-        selectedEnvironment.environment_id,
-        workflow.workflow_id
-      );
-
-      setFinalResultData(resultData);
-    } catch (err) {
-      console.error('Failed to load final results:', err);
-      setFinalResultData({
-        error: 'Failed to load final results: ' + err.message
-      });
-    } finally {
-      setLoadingResult(false);
+      console.error('Failed to view results:', err);
     }
   };
 
@@ -1015,8 +960,8 @@ const WorkflowManager = ({ selectedEnvironment }) => {
                     <div style={{ display: 'flex', gap: '8px', alignItems: 'center', margin: '8px 0' }}>
                       <span style={{
                         ...styles.badge,
-                        ...(workflow.status === 'completed' ? styles.badgeGreen :
-                          workflow.status === 'failed' ? styles.badgeRed :
+                        ...(workflow.status === 'completed' ? styles.badgeGreen : 
+                            workflow.status === 'failed' ? styles.badgeRed : 
                             workflow.status === 'running' ? styles.badgeBlue : styles.badgeGray)
                       }}>
                         {workflow.status || 'submitted'}
@@ -1036,15 +981,13 @@ const WorkflowManager = ({ selectedEnvironment }) => {
                     {workflow.task_statistics && (
                       <div style={{ marginTop: '8px' }}>
                         <span style={{ fontSize: '12px', color: '#6b7280' }}>
-                          Progress: {Object.entries(workflow.task_statistics).map(([status, count]) =>
+                          Progress: {Object.entries(workflow.task_statistics).map(([status, count]) => 
                             `${count} ${status}`
                           ).join(', ')}
                         </span>
                       </div>
                     )}
                   </div>
-
-                  {/* 修改：更新按钮区域 */}
                   <div style={styles.itemActions}>
                     <button
                       onClick={() => handleRefreshStatus(workflow.workflow_id)}
@@ -1053,31 +996,13 @@ const WorkflowManager = ({ selectedEnvironment }) => {
                     >
                       <Activity style={styles.actionIcon} />
                     </button>
-
-                    {/* 修改：眼睛图标现在查看工作流详情 */}
                     <button
-                      onClick={() => handleViewWorkflowDetails(workflow)}
-                      style={{ ...styles.actionButton, ...styles.actionButtonGray }}
-                      title="View Workflow Details"
+                      onClick={() => handleViewResults(workflow)}
+                      style={{ ...styles.actionButton, ...styles.actionButtonGreen }}
+                      title="View Results"
                     >
                       <Eye style={styles.actionIcon} />
                     </button>
-
-                    {/* 新增：图表图标查看最终结果 */}
-                    <button
-                      onClick={() => handleViewFinalResults(workflow)}
-                      style={{
-                        ...styles.actionButton,
-                        ...styles.actionButtonGreen,
-                        // 只有完成的工作流才能查看结果
-                        opacity: workflow.status === 'completed' ? 1 : 0.5
-                      }}
-                      title="View Final Results"
-                      disabled={workflow.status !== 'completed'}
-                    >
-                      <BarChart3 style={styles.actionIcon} />
-                    </button>
-
                     <button
                       onClick={() => handleDeleteWorkflow(workflow.workflow_id)}
                       style={{ ...styles.actionButton, ...styles.actionButtonRed }}
@@ -1093,7 +1018,7 @@ const WorkflowManager = ({ selectedEnvironment }) => {
         )}
       </div>
 
-      {/* 创建工作流模态框 */}
+      {/* 简化的创建工作流模态框 */}
       <Modal
         isOpen={showCreateForm}
         onClose={() => setShowCreateForm(false)}
@@ -1117,7 +1042,7 @@ const WorkflowManager = ({ selectedEnvironment }) => {
                 Load Example
               </button>
             </div>
-
+            
             <JsonEditor
               value={workflowFormData.workflowJson}
               onChange={(value) => setWorkflowFormData({ workflowJson: value })}
@@ -1199,16 +1124,15 @@ const WorkflowManager = ({ selectedEnvironment }) => {
         </div>
       </Modal>
 
-      {/* 修改：工作流详情模态框 */}
+      {/* Results Modal */}
       <Modal
-        isOpen={showWorkflowDetailModal}
-        onClose={() => setShowWorkflowDetailModal(false)}
-        title={`Workflow Details: ${selectedWorkflow?.name}`}
+        isOpen={showResultModal}
+        onClose={() => setShowResultModal(false)}
+        title={`Workflow Results: ${selectedWorkflow?.name}`}
         size="large"
       >
         {selectedWorkflow && (
           <div>
-            {/* 基础信息 */}
             <div style={styles.grid2}>
               <div>
                 <label style={styles.formLabel}>Workflow ID</label>
@@ -1220,72 +1144,37 @@ const WorkflowManager = ({ selectedEnvironment }) => {
                 <label style={styles.formLabel}>Status</label>
                 <span style={{
                   ...styles.badge,
-                  ...(selectedWorkflow.status === 'completed' ? styles.badgeGreen :
-                    selectedWorkflow.status === 'failed' ? styles.badgeRed :
+                  ...(selectedWorkflow.status === 'completed' ? styles.badgeGreen : 
+                      selectedWorkflow.status === 'failed' ? styles.badgeRed : 
                       selectedWorkflow.status === 'running' ? styles.badgeBlue : styles.badgeGray)
                 }}>
                   {selectedWorkflow.status || 'submitted'}
                 </span>
               </div>
-              <div>
-                <label style={styles.formLabel}>Created</label>
-                <p style={{ margin: '4px 0 0 0', fontSize: '14px' }}>
-                  {formatDate(selectedWorkflow.created_at)}
-                </p>
-              </div>
-              <div>
-                <label style={styles.formLabel}>Total Tasks</label>
-                <p style={{ margin: '4px 0 0 0', fontSize: '14px' }}>
-                  {selectedWorkflow.total_tasks || 0}
-                </p>
-              </div>
             </div>
 
-            {/* 描述 */}
-            {selectedWorkflow.description && (
-              <div style={{ marginTop: '16px' }}>
-                <label style={styles.formLabel}>Description</label>
-                <p style={{ margin: '4px 0 0 0', fontSize: '14px' }}>
-                  {selectedWorkflow.description}
-                </p>
-              </div>
-            )}
-
-            {/* 任务进度 */}
             {selectedWorkflow.tasks && (
               <div style={{ marginTop: '24px' }}>
                 <label style={{ ...styles.formLabel, marginBottom: '8px' }}>
                   Task Progress ({selectedWorkflow.tasks.length} tasks)
                 </label>
-                <div style={{ maxHeight: '300px', overflow: 'auto' }}>
+                <div style={{ maxHeight: '200px', overflow: 'auto' }}>
                   {selectedWorkflow.tasks.map((task, index) => (
                     <div key={index} style={{
                       display: 'flex',
                       justifyContent: 'space-between',
                       alignItems: 'center',
-                      padding: '12px',
-                      marginBottom: '8px',
+                      padding: '8px 12px',
+                      marginBottom: '4px',
                       backgroundColor: '#f8fafc',
-                      borderRadius: '6px',
-                      fontSize: '14px',
-                      border: '1px solid #e2e8f0'
+                      borderRadius: '4px',
+                      fontSize: '12px'
                     }}>
-                      <div>
-                        <div style={{ fontWeight: '500', marginBottom: '4px' }}>{task.name}</div>
-                        <div style={{ fontSize: '12px', color: '#6b7280' }}>
-                          Type: {task.task_type}
-                          {task.function_name && ` • Function: ${task.function_name}`}
-                        </div>
-                        {task.dependencies && task.dependencies.length > 0 && (
-                          <div style={{ fontSize: '12px', color: '#6b7280', marginTop: '4px' }}>
-                            Dependencies: {task.dependencies.map(dep => dep.split('#').pop()).join(', ')}
-                          </div>
-                        )}
-                      </div>
+                      <span style={{ fontWeight: '500' }}>{task.name}</span>
                       <span style={{
                         ...styles.badge,
-                        ...(task.status === 'completed' ? styles.badgeGreen :
-                          task.status === 'failed' ? styles.badgeRed :
+                        ...(task.status === 'completed' ? styles.badgeGreen : 
+                            task.status === 'failed' ? styles.badgeRed : 
                             task.status === 'running' ? styles.badgeBlue : styles.badgeGray)
                       }}>
                         {task.status}
@@ -1296,150 +1185,10 @@ const WorkflowManager = ({ selectedEnvironment }) => {
               </div>
             )}
 
-            {/* 任务统计 */}
-            {selectedWorkflow.task_statistics && (
+            {selectedResult && (
               <div style={{ marginTop: '24px' }}>
-                <label style={styles.formLabel}>Task Statistics</label>
-                <div style={{
-                  display: 'grid',
-                  gridTemplateColumns: 'repeat(auto-fit, minmax(100px, 1fr))',
-                  gap: '12px',
-                  marginTop: '8px'
-                }}>
-                  {Object.entries(selectedWorkflow.task_statistics).map(([status, count]) => (
-                    <div key={status} style={{
-                      textAlign: 'center',
-                      padding: '12px',
-                      backgroundColor: '#f8fafc',
-                      borderRadius: '6px',
-                      border: '1px solid #e2e8f0'
-                    }}>
-                      <div style={{ fontSize: '24px', fontWeight: '600', color: '#1f2937' }}>{count}</div>
-                      <div style={{ fontSize: '12px', color: '#6b7280', textTransform: 'capitalize' }}>{status}</div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-          </div>
-        )}
-      </Modal>
-
-      {/* 新增：最终结果模态框（带下载CSV功能）*/}
-      <Modal
-        isOpen={showFinalResultModal}
-        onClose={() => setShowFinalResultModal(false)}
-        title={`Final Results: ${selectedWorkflow?.name}`}
-        size="large"
-      >
-        {selectedWorkflow && (
-          <div>
-            {/* 结果摘要信息 */}
-            <div style={styles.grid3}>
-              <div>
-                <label style={styles.formLabel}>Workflow ID</label>
-                <p style={{ margin: '4px 0 0 0', fontSize: '14px', fontWeight: '500' }}>
-                  {selectedWorkflow.workflow_id}
-                </p>
-              </div>
-              <div>
-                <label style={styles.formLabel}>Status</label>
-                <span style={{
-                  ...styles.badge,
-                  ...(selectedWorkflow.status === 'completed' ? styles.badgeGreen :
-                    selectedWorkflow.status === 'failed' ? styles.badgeRed : styles.badgeGray)
-                }}>
-                  {selectedWorkflow.status}
-                </span>
-              </div>
-              <div>
-                <label style={styles.formLabel}>Completed</label>
-                <p style={{ margin: '4px 0 0 0', fontSize: '14px' }}>
-                  {formatDate(selectedWorkflow.completed_at) || 'In progress'}
-                </p>
-              </div>
-            </div>
-
-            {/* 加载状态或结果内容 */}
-            {loadingResult ? (
-              <div style={{ ...styles.loadingContainer, margin: '40px 0' }}>
-                <div style={styles.spinner}></div>
-                <span style={{ marginLeft: '8px', color: '#6b7280' }}>Loading final results...</span>
-              </div>
-            ) : finalResultData?.error ? (
-              <div style={{
-                ...styles.errorMessage,
-                margin: '20px 0'
-              }}>
-                <span style={styles.errorText}>{finalResultData.error}</span>
-              </div>
-            ) : finalResultData?.message ? (
-              <div style={{
-                backgroundColor: '#fef3c7',
-                border: '1px solid #f59e0b',
-                borderRadius: '6px',
-                padding: '16px',
-                margin: '20px 0'
-              }}>
-                <div style={{ color: '#92400e', fontSize: '14px' }}>
-                  {finalResultData.message}
-                </div>
-                {finalResultData.final_task_name && (
-                  <div style={{ color: '#6b7280', fontSize: '12px', marginTop: '4px' }}>
-                    Final task: {finalResultData.final_task_name}
-                  </div>
-                )}
-              </div>
-            ) : finalResultData?.data ? (
-              <div style={{ marginTop: '24px' }}>
-                {/* 结果摘要和下载按钮 */}
-                <div style={{
-                  display: 'flex',
-                  justifyContent: 'space-between',
-                  alignItems: 'center',
-                  marginBottom: '16px'
-                }}>
-                  <label style={styles.formLabel}>Result Summary</label>
-                  <button
-                    onClick={() => downloadCSV(
-                      finalResultData.data,
-                      `${selectedWorkflow.name.replace(/[^a-zA-Z0-9]/g, '_')}_${finalResultData.final_task_name}_results.csv`
-                    )}
-                    style={{
-                      ...styles.primaryButton,
-                      backgroundColor: '#16a34a',
-                      fontSize: '12px',
-                      padding: '6px 12px'
-                    }}
-                  >
-                    <Download style={{ width: '14px', height: '14px', marginRight: '4px' }} />
-                    Download CSV
-                  </button>
-                </div>
-
-                <div style={{
-                  backgroundColor: '#f0f9ff',
-                  border: '1px solid #0ea5e9',
-                  borderRadius: '6px',
-                  padding: '12px',
-                  fontSize: '14px',
-                  marginBottom: '16px'
-                }}>
-                  <div style={{ display: 'flex', gap: '24px', flexWrap: 'wrap' }}>
-                    <span><strong>Final Task:</strong> {finalResultData.final_task_name}</span>
-                    <span><strong>Rows:</strong> {finalResultData.result_summary?.total_rows || 0}</span>
-                    <span><strong>Columns:</strong> {finalResultData.result_summary?.total_columns || 0}</span>
-                  </div>
-                  {finalResultData.result_summary?.columns && (
-                    <div style={{ marginTop: '8px' }}>
-                      <strong>Columns:</strong> {finalResultData.result_summary.columns.join(', ')}
-                    </div>
-                  )}
-                </div>
-
-                {/* 数据表格 */}
                 <label style={{ ...styles.formLabel, marginBottom: '8px' }}>
-                  Final Result Data
+                  Task Result: {selectedResult.task_name}
                 </label>
                 <div style={{
                   maxHeight: '400px',
@@ -1450,9 +1199,9 @@ const WorkflowManager = ({ selectedEnvironment }) => {
                   <table style={{ width: '100%', fontSize: '12px', borderCollapse: 'collapse' }}>
                     <thead style={{ backgroundColor: '#f8fafc', position: 'sticky', top: 0 }}>
                       <tr>
-                        {finalResultData.data.length > 0 && Object.keys(finalResultData.data[0]).map(col => (
-                          <th key={col} style={{
-                            padding: '8px',
+                        {selectedResult.data.length > 0 && Object.keys(selectedResult.data[0]).map(col => (
+                          <th key={col} style={{ 
+                            padding: '8px', 
                             textAlign: 'left',
                             borderBottom: '1px solid #e2e8f0',
                             fontWeight: '600'
@@ -1463,34 +1212,31 @@ const WorkflowManager = ({ selectedEnvironment }) => {
                       </tr>
                     </thead>
                     <tbody>
-                      {finalResultData.data.slice(0, 100).map((row, index) => (
+                      {selectedResult.data.slice(0, 100).map((row, index) => (
                         <tr key={index} style={{ borderBottom: '1px solid #f3f4f6' }}>
                           {Object.values(row).map((value, colIndex) => (
                             <td key={colIndex} style={{ padding: '6px 8px' }}>
-                              {typeof value === 'boolean' ? (value ? 'true' : 'false') :
-                                typeof value === 'object' && value !== null ? JSON.stringify(value) :
-                                  String(value)}
+                              {typeof value === 'object' ? JSON.stringify(value) : String(value)}
                             </td>
                           ))}
                         </tr>
                       ))}
                     </tbody>
                   </table>
-                  {finalResultData.data.length > 100 && (
+                  {selectedResult.data.length > 100 && (
                     <div style={{ padding: '8px', textAlign: 'center', fontSize: '12px', color: '#6b7280' }}>
-                      Showing first 100 rows of {finalResultData.data.length} total rows
+                      Showing first 100 rows of {selectedResult.data.length} total rows
                     </div>
                   )}
                 </div>
               </div>
-            ) : null}
+            )}
           </div>
         )}
       </Modal>
     </div>
   );
 };
-
 
 // Enhanced Tree Graph Visualizer using new tree-graph API
 const TwinGraphVisualizer = ({ selectedEnvironment }) => {

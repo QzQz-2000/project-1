@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+aiokafka
+kafka-python
+python-dotenv
+pydantic
+pydantic-settings
+aiohttp
+motor
+redis

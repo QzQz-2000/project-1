@@ -166,14 +166,13 @@ class Model(TimestampMixin):
     description: Optional[str] = None
     properties: Dict[str, PropertyDefinition] = Field(default_factory=dict)
 
-# Device - 仅存储设备基本信息，不存储属性
 class DeviceCreate(BaseModel):
     device_id: str
     display_name: str
     description: Optional[str] = None
-    device_type: Optional[str] = None  # 设备类型，如sensor, actuator, gateway
-    location: Optional[str] = None     # 设备位置
-    manufacturer: Optional[str] = None # 制造商
+    device_type: Optional[str] = None
+    location: Optional[str] = None
+    manufacturer: Optional[str] = None
     
     @validator('device_id')
     def validate_device_id(cls, v):
@@ -196,7 +195,6 @@ class Device(TimestampMixin):
     manufacturer: Optional[str] = None
     telemetry_points_count: int = 0
 
-# Twin - model的实例，包含属性值
 class TwinCreate(BaseModel):
     twin_id: str
     model_id: str
@@ -1544,6 +1542,42 @@ async def update_twin(
 ):
     """Update a twin."""
     return await service.update(environment_id, twin_id, data)
+
+
+@app.post("/environments/{environment_id}/twins/batch-update", 
+         response_model=Dict[str, int], tags=["Twins"])
+async def batch_update_twins(
+    environment_id: str = Path(..., description="Environment identifier"),
+    updates: List[Dict] = Body(..., description="Batch update data"),
+    service: TwinService = Depends(get_twin_service)
+):
+    """批量更新多个twins的属性"""
+    success_count = 0
+    failure_count = 0
+    
+    for update_data in updates:
+        try:
+            twin_id = update_data["twin_id"]
+            properties = update_data.get("properties", {})
+            telemetry_last_updated = update_data.get("telemetry_last_updated")
+            
+            update_obj = TwinUpdate(
+                properties=properties,
+                telemetry_last_updated=telemetry_last_updated
+            )
+            
+            await service.update(environment_id, twin_id, update_obj)
+            success_count += 1
+            
+        except Exception as e:
+            logger.error(f"批量更新Twin失败: {e}")
+            failure_count += 1
+    
+    return {
+        "success_count": success_count,
+        "failure_count": failure_count,
+        "total_count": len(updates)
+    }
 
 @app.delete("/environments/{environment_id}/twins/{twin_id}", response_model=OperationResponse, tags=["Twins"])
 async def delete_twin(

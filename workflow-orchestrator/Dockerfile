@@ -13,7 +13,7 @@ COPY . .
 RUN mkdir -p /app/data
 
 # Expose port
-EXPOSE 8000
+EXPOSE 8001
 
 # Start the application
 CMD ["python", "main.py"]

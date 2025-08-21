@@ -5,6 +5,7 @@ import signal
 from datetime import datetime
 from typing import Dict, Union, Optional, List
 from contextlib import asynccontextmanager
+import time
 
 from aiokafka import AIOKafkaConsumer
 from aiokafka.errors import KafkaError
@@ -15,10 +16,10 @@ from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
     # Kafka 配置
-    KAFKA_TOPIC: str
-    KAFKA_BOOTSTRAP_SERVERS: str
+    KAFKA_TOPIC: str = "telemetry"
+    KAFKA_BOOTSTRAP_SERVERS: str = "kafka:9092"
     KAFKA_GROUP_ID: str
-    KAFKA_AUTO_OFFSET_RESET: str = "latest"  # 改为 latest，避免重复处理历史数据
+    KAFKA_AUTO_OFFSET_RESET: str = "latest"
     KAFKA_ENABLE_AUTO_COMMIT: bool = True
     KAFKA_AUTO_COMMIT_INTERVAL_MS: int = 5000
     KAFKA_MAX_POLL_RECORDS: int = 500
@@ -35,7 +36,8 @@ class Settings(BaseSettings):
     # 应用配置
     QUEUE_MAX_SIZE: int = 10000
     BATCH_TIMEOUT_SECONDS: float = 1.0
-    MAX_RETRY_ATTEMPTS: int = 3
+    MAX_RETRY_ATTEMPTS: int = 5  # 增加重试次数
+    INFLUX_CONNECTION_RETRY_DELAY: int = 5 # InfluxDB 连接重试间隔（秒）
     LOG_LEVEL: str = "INFO"
 
     class Config:
@@ -55,7 +57,7 @@ class Telemetry(BaseModel):
     timestamp: datetime = Field(default_factory=datetime.utcnow)
     device_id: str
     environment_id: str
-    payload: Dict[str, Union[int, float, str, bool, None]]  # 设备数据
+    payload: Dict[str, Union[int, float, str, bool, None]]
 
 
 class Metrics:
@@ -63,45 +65,63 @@ class Metrics:
         self.messages_consumed = 0
         self.messages_written = 0
         self.messages_failed = 0
+        self.messages_retried = 0
         self.last_message_time = None
         
     def log_status(self):
         logger.info(
             f"状态统计 - 已消费: {self.messages_consumed}, "
             f"已写入: {self.messages_written}, "
+            f"重试: {self.messages_retried}, "
             f"失败: {self.messages_failed}"
         )
 
 class InfluxWriter:
     def __init__(self, metrics: Metrics):
         self.metrics = metrics
-        self.client = InfluxDBClient(
-            url=settings.INFLUXDB_URL,
-            token=settings.INFLUXDB_TOKEN,
-            org=settings.INFLUXDB_ORG,
-            enable_gzip=True,
-            timeout=30_000, 
-            retries=3
-        )       
-        try:
-            self.client.ping()
-            logger.info("InfluxDB 连接测试成功")
-        except Exception as e:
-            logger.error(f"InfluxDB 连接失败: {e}")
-            raise
-            
-        self.write_api = self.client.write_api(write_options=WriteOptions(
-            batch_size=settings.INFLUXDB_BATCH_SIZE,
-            flush_interval=settings.INFLUXDB_FLUSH_INTERVAL_SECONDS * 1000,
-            retry_interval=settings.INFLUXDB_RETRY_INTERVAL,
-            max_retries=settings.MAX_RETRY_ATTEMPTS,
-            write_type=ASYNCHRONOUS
-        ))
-        logger.info("InfluxDB Writer 初始化成功")
+        self.client = None
+        self.write_api = None
+        
+        # 新增：InfluxDB 连接重试逻辑
+        self._connect_to_influxdb()
+
+    def _connect_to_influxdb(self):
+        retry_attempts = 0
+        while retry_attempts < settings.MAX_RETRY_ATTEMPTS:
+            try:
+                self.client = InfluxDBClient(
+                    url=settings.INFLUXDB_URL,
+                    token=settings.INFLUXDB_TOKEN,
+                    org=settings.INFLUXDB_ORG,
+                    enable_gzip=True,
+                    timeout=30_000, 
+                    retries=3
+                )
+                self.client.ping()
+                logger.info("InfluxDB 连接测试成功")
+                self.write_api = self.client.write_api(write_options=WriteOptions(
+                    batch_size=settings.INFLUXDB_BATCH_SIZE,
+                    flush_interval=settings.INFLUXDB_FLUSH_INTERVAL_SECONDS * 1000,
+                    retry_interval=settings.INFLUXDB_RETRY_INTERVAL,
+                    max_retries=settings.MAX_RETRY_ATTEMPTS,
+                    write_type=ASYNCHRONOUS
+                ))
+                logger.info("InfluxDB Writer 初始化成功")
+                return
+            except Exception as e:
+                retry_attempts += 1
+                logger.error(f"InfluxDB 连接失败 ({retry_attempts}/{settings.MAX_RETRY_ATTEMPTS}): {e}")
+                if retry_attempts < settings.MAX_RETRY_ATTEMPTS:
+                    logger.info(f"等待 {settings.INFLUX_CONNECTION_RETRY_DELAY} 秒后重试...")
+                    time.sleep(settings.INFLUX_CONNECTION_RETRY_DELAY)
+                else:
+                    logger.critical("InfluxDB 连接失败，达到最大重试次数，服务将退出")
+                    raise
 
     async def write_batch(self, data_list: List[Telemetry]):
         if not data_list:
             return      
+        
         points = []
         for data in data_list:
             try:
@@ -134,16 +154,18 @@ class InfluxWriter:
                     record=points
                 )
                 self.metrics.messages_written += len(points)
-                logger.debug(f"成功写入 {len(points)} 条数据到 InfluxDB")
+                logger.info(f"成功写入 {len(points)} 条数据到 InfluxDB")
             except Exception as e:
                 logger.error(f"[InfluxDB] 批量写入失败: {e}")
-                self.metrics.messages_failed += len(points)
+                # 不再在此处重试，而是将失败的批次返回或放入重试队列
                 raise
 
     def close(self):
         try:
-            self.write_api.close()
-            self.client.close()
+            if self.write_api:
+                self.write_api.close()
+            if self.client:
+                self.client.close()
             logger.info("InfluxDB 客户端已关闭")
         except Exception as e:
             logger.error(f"关闭 InfluxDB 客户端时出错: {e}")
@@ -155,6 +177,7 @@ class KafkaInfluxBridge:
         self.writer = InfluxWriter(self.metrics)
         self.consumer = None
         self.queue = asyncio.Queue(maxsize=settings.QUEUE_MAX_SIZE)
+        self.retry_queue = asyncio.Queue() # 新增：重试队列
         self.running = True
         self._tasks = []
 
@@ -181,6 +204,7 @@ class KafkaInfluxBridge:
             self._tasks = [
                 asyncio.create_task(self.consume_loop()),
                 asyncio.create_task(self.write_loop()),
+                asyncio.create_task(self.retry_loop()), # 新增：重试循环
                 asyncio.create_task(self.monitor_loop())
             ]
             
@@ -214,7 +238,8 @@ class KafkaInfluxBridge:
                     logger.warning(f"[Kafka] 数据验证失败: {e.errors()}")
                     self.metrics.messages_failed += 1
                 except Exception as e:
-                    logger.error(f"[Kafka] 处理消息时出错: {e}")
+                    # 捕获可能的 json.JSONDecodeError
+                    logger.error(f"[Kafka] 处理消息时出错: {e}, 消息值: {msg.value}")
                     self.metrics.messages_failed += 1
                     
         except KafkaError as e:
@@ -259,9 +284,10 @@ class KafkaInfluxBridge:
                         batch.clear()
                         last_flush_time = current_time
                     except Exception as e:
-                        logger.error(f"批量写入失败，将重试: {e}")
-                        # 可以实现重试逻辑或将失败的批次保存到备份队列
-                        await asyncio.sleep(1)
+                        logger.error(f"批量写入失败，将数据放入重试队列: {e}")
+                        # 将失败的批次放入重试队列
+                        await self.retry_queue.put(batch)
+                        batch = [] # 清空当前批次
                         
             except Exception as e:
                 logger.error(f"写入循环出错: {e}", exc_info=True)
@@ -273,6 +299,43 @@ class KafkaInfluxBridge:
                 await self.writer.write_batch(batch)
             except Exception as e:
                 logger.error(f"处理剩余批次时失败: {e}")
+                await self.retry_queue.put(batch)
+    
+    async def retry_loop(self):
+        """新增：处理重试队列中的失败批次"""
+        while self.running or not self.retry_queue.empty():
+            try:
+                batch = await asyncio.wait_for(
+                    self.retry_queue.get(), 
+                    timeout=1.0 # 保持活跃
+                )
+                
+                # 指数退避重试
+                retry_count = 0
+                while retry_count < settings.MAX_RETRY_ATTEMPTS:
+                    try:
+                        await self.writer.write_batch(batch)
+                        self.metrics.messages_retried += len(batch)
+                        logger.info(f"重试成功，写入 {len(batch)} 条数据")
+                        break # 重试成功，退出循环
+                    except Exception as e:
+                        retry_count += 1
+                        logger.warning(
+                            f"重试写入失败 ({retry_count}/{settings.MAX_RETRY_ATTEMPTS}): {e}"
+                        )
+                        if retry_count < settings.MAX_RETRY_ATTEMPTS:
+                            # 延迟重试
+                            await asyncio.sleep(2**retry_count)
+                        else:
+                            logger.error(f"批量写入失败，达到最大重试次数，数据丢失: {e}")
+                            self.metrics.messages_failed += len(batch)
+                self.retry_queue.task_done()
+                
+            except asyncio.TimeoutError:
+                pass # 队列为空，继续等待
+            except Exception as e:
+                logger.error(f"重试循环出错: {e}", exc_info=True)
+                await asyncio.sleep(1)
 
     async def monitor_loop(self):
         """定期输出监控信息"""
@@ -294,7 +357,14 @@ class KafkaInfluxBridge:
         # 等待队列清空（最多等待30秒）
         wait_time = 0
         while not self.queue.empty() and wait_time < 30:
-            logger.info(f"等待队列清空，剩余消息: {self.queue.qsize()}")
+            logger.info(f"等待主队列清空，剩余消息: {self.queue.qsize()}")
+            await asyncio.sleep(1)
+            wait_time += 1
+        
+        # 等待重试队列清空（最多等待30秒）
+        wait_time = 0
+        while not self.retry_queue.empty() and wait_time < 30:
+            logger.info(f"等待重试队列清空，剩余消息: {self.retry_queue.qsize()}")
             await asyncio.sleep(1)
             wait_time += 1
             
@@ -311,6 +381,12 @@ class KafkaInfluxBridge:
         self.metrics.log_status()
         logger.info("服务已完全停止")
 
+def setup_signal_handlers(bridge):
+    """设置信号处理函数，用于优雅停机"""
+    loop = asyncio.get_event_loop()
+    loop.add_signal_handler(signal.SIGINT, lambda: asyncio.create_task(bridge.stop()))
+    loop.add_signal_handler(signal.SIGTERM, lambda: asyncio.create_task(bridge.stop()))
+    logger.info("已设置信号处理程序")
 
 async def main():
     bridge = KafkaInfluxBridge()
