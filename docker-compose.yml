@@ -224,6 +224,7 @@ services:
       - ./kafka-influx-service/.env # 如果 .env 文件也在服务目录里，相应调整路径
     depends_on:
       - broker
+      - influxdb
     environment: # 确保这里有 Kafka 和 InfluxDB 连接信息
       KAFKA_BOOTSTRAP_SERVERS: broker:29092 # 内部网络地址
       INFLUXDB_URL: http://influxdb:8086
@@ -277,6 +278,22 @@ services:
       - ./workflow-orchestrator/data:/app/data
     restart: unless-stopped
 
+  grafana:
+    image: grafana/grafana:9.5.1
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+    restart: unless-stopped
+    depends_on:
+      - influxdb
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: false        # 关闭匿名访问
+      GF_SECURITY_ADMIN_USER: admin           # 管理员账号
+      GF_SECURITY_ADMIN_PASSWORD: admin123    # 管理员密码
+
+
 volumes:
   mongo-data:
   neo4j_data:
@@ -284,3 +301,4 @@ volumes:
   influxdb_data:
   mosquitto-data:
   mosquitto-logs:
+  grafana-data:

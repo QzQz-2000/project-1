@@ -496,6 +496,45 @@ const formatDate = (dateString) => {
   }
 };
 
+const GrafanaDashboard = ({ selectedEnvironment }) => {
+  const [dashboardUrl] = useState(
+    'http://localhost:3000/d/a3640573-e6d0-4dea-9aff-5eae6808544a/device?orgId=1&refresh=5s&from=1755829753896&to=1755830053896&theme=current'
+  );
+
+  const openGrafanaExternal = () => {
+    window.open('http://localhost:3000', '_blank');
+  };
+
+  const openDashboardExternal = () => {
+    window.open(dashboardUrl, '_blank');
+  };
+
+  if (!selectedEnvironment) {
+    return (
+      <div style={styles.emptyState}>
+        <BarChart3 style={styles.emptyStateIcon} />
+        <p>Please select an environment first</p>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <div style={styles.contentHeader}>
+        <h2 style={styles.contentTitle}>Grafana Dashboard</h2>
+        <div style={{ display: 'flex', gap: '12px' }}>
+          <button onClick={openGrafanaExternal} style={styles.primaryButton}>
+            Open Grafana
+          </button>
+          <button onClick={openDashboardExternal} style={styles.primaryButton}>
+            Open Dashboard
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 // CSV下载功能
 const downloadCSV = (data, filename = 'workflow_result.csv') => {
   if (!data || data.length === 0) {
@@ -643,6 +682,170 @@ class DigitalTwinAPI {
       method: 'DELETE'
     });
   }
+
+  // Model management
+  static async getModels(envId) {
+    const response = await this.request(`/environments/${envId}/models`);
+    return response.items || response;
+  }
+
+  static async getModel(envId, modelId) {
+    return this.request(`/environments/${envId}/models/${modelId}`);
+  }
+
+  static async createModel(envId, data) {
+    return this.request(`/environments/${envId}/models`, {
+      method: 'POST',
+      body: JSON.stringify(data)
+    });
+  }
+
+  static async updateModel(envId, modelId, data) {
+    return this.request(`/environments/${envId}/models/${modelId}`, {
+      method: 'PUT',
+      body: JSON.stringify(data)
+    });
+  }
+
+  static async deleteModel(envId, modelId) {
+    return this.request(`/environments/${envId}/models/${modelId}`, {
+      method: 'DELETE'
+    });
+  }
+
+  // Digital twin management
+  static async getTwins(envId) {
+    const response = await this.request(`/environments/${envId}/twins`);
+    return response.items || response;
+  }
+
+  static async getTwin(envId, twinId) {
+    return this.request(`/environments/${envId}/twins/${twinId}`);
+  }
+
+  static async createTwin(envId, data) {
+    return this.request(`/environments/${envId}/twins`, {
+      method: 'POST',
+      body: JSON.stringify(data)
+    });
+  }
+
+  static async updateTwin(envId, twinId, data) {
+    return this.request(`/environments/${envId}/twins/${twinId}`, {
+      method: 'PUT',
+      body: JSON.stringify(data)
+    });
+  }
+
+  static async deleteTwin(envId, twinId) {
+    return this.request(`/environments/${envId}/twins/${twinId}`, {
+      method: 'DELETE'
+    });
+  }
+
+  // Device management (updated - no properties)
+  static async getDevices(envId) {
+    const response = await this.request(`/environments/${envId}/devices`);
+    return response.items || response;
+  }
+
+  static async getDevice(envId, deviceId) {
+    return this.request(`/environments/${envId}/devices/${deviceId}`);
+  }
+
+  static async createDevice(envId, data) {
+    return this.request(`/environments/${envId}/devices`, {
+      method: 'POST',
+      body: JSON.stringify(data)
+    });
+  }
+
+  static async updateDevice(envId, deviceId, data) {
+    return this.request(`/environments/${envId}/devices/${deviceId}`, {
+      method: 'PUT',
+      body: JSON.stringify(data)
+    });
+  }
+
+  static async deleteDevice(envId, deviceId) {
+    return this.request(`/environments/${envId}/devices/${deviceId}`, {
+      method: 'DELETE'
+    });
+  }
+
+  // Device-Twin Mapping management (NEW)
+  static async getDeviceTwinMappings(envId) {
+    const response = await this.request(`/environments/${envId}/mappings`);
+    return response.items || response;
+  }
+
+  static async getDeviceMappings(envId, deviceId) {
+    return this.request(`/environments/${envId}/mappings/device/${deviceId}`);
+  }
+
+  static async getTwinMappings(envId, twinId) {
+    return this.request(`/environments/${envId}/mappings/twin/${twinId}`);
+  }
+
+  static async createDeviceTwinMapping(envId, data) {
+    return this.request(`/environments/${envId}/mappings`, {
+      method: 'POST',
+      body: JSON.stringify(data)
+    });
+  }
+
+  static async updateDeviceTwinMapping(envId, deviceId, twinId, data) {
+    return this.request(`/environments/${envId}/mappings/${deviceId}/${twinId}`, {
+      method: 'PUT',
+      body: JSON.stringify(data)
+    });
+  }
+
+  static async deleteDeviceTwinMapping(envId, deviceId, twinId) {
+    return this.request(`/environments/${envId}/mappings/${deviceId}/${twinId}`, {
+      method: 'DELETE'
+    });
+  }
+
+  // Relationship management
+  static async getRelationships(envId) {
+    const response = await this.request(`/environments/${envId}/relationships`);
+    return response.items || response;
+  }
+
+  static async createRelationship(envId, data) {
+    return this.request(`/environments/${envId}/relationships`, {
+      method: 'POST',
+      body: JSON.stringify(data)
+    });
+  }
+
+  static async updateRelationship(envId, sourceId, targetId, relationshipName, data) {
+    return this.request(`/environments/${envId}/relationships/${sourceId}/${targetId}/${relationshipName}`, {
+      method: 'PUT',
+      body: JSON.stringify(data)
+    });
+  }
+
+  static async deleteRelationship(envId, sourceId, targetId, relationshipName) {
+    return this.request(`/environments/${envId}/relationships/${sourceId}/${targetId}/${relationshipName}`, {
+      method: 'DELETE'
+    });
+  }
+
+  // Tree Graph and Advanced features (UPDATED)
+  static async getTreeGraph(envId, rootTwinId = null) {
+    const url = rootTwinId ? `/environments/${envId}/tree-graph?root_twin_id=${rootTwinId}` : `/environments/${envId}/tree-graph`;
+    return this.request(url);
+  }
+
+  static async getRelationshipStats(envId) {
+    return this.request(`/environments/${envId}/relationships/stats`);
+  }
+
+  static async findPath(envId, sourceId, targetId, maxDepth = 5) {
+    return this.request(`/environments/${envId}/relationships/path/${sourceId}/${targetId}?max_depth=${maxDepth}`);
+  }
 }
 
 // Generic modal component
@@ -657,7 +860,7 @@ const Modal = ({ isOpen, onClose, title, children, size = 'medium' }) => {
         <div style={styles.modalHeader}>
           <h2 style={styles.modalTitle}>{title}</h2>
           <button onClick={onClose} style={styles.closeButton}>
-            <X style={{ width: '24px', height: '24px' }} />
+            <X style={{width: '24px', height: '24px'}} />
           </button>
         </div>
         {children}
@@ -2551,6 +2754,7 @@ const DigitalTwinPlatform = () => {
     { id: 'mappings', label: 'Device Mappings', icon: Link },
     { id: 'workflows', label: 'Workflows', icon: Activity },
     { id: 'graph', label: 'Tree Explorer', icon: Network },
+    { id: 'dashboard', label: 'Analytics', icon: BarChart3 },
   ];
 
   return (
@@ -2660,6 +2864,11 @@ const DigitalTwinPlatform = () => {
             )}
             {activeTab === 'graph' && (
               <TwinGraphVisualizer
+                selectedEnvironment={selectedEnvironment}
+              />
+            )}
+            {activeTab === 'dashboard' && (  // 添加这个条件
+              <GrafanaDashboard
                 selectedEnvironment={selectedEnvironment}
               />
             )}
