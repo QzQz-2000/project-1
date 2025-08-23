@@ -691,13 +691,6 @@ class DigitalTwinAPI {
     });
   }
 
-  static async updateEnvironment(envId, data) {
-    return this.request(`/environments/${envId}`, {
-      method: 'PUT',
-      body: JSON.stringify(data)
-    });
-  }
-
   static async deleteEnvironment(envId) {
     return this.request(`/environments/${envId}`, {
       method: 'DELETE'
@@ -1716,6 +1709,784 @@ const WorkflowManager = ({ selectedEnvironment }) => {
 };
 
 
+// // Enhanced Tree Graph Visualizer using new tree-graph API
+// const TwinGraphVisualizer = ({ selectedEnvironment }) => {
+//   const [treeData, setTreeData] = useState({ nodes: [], relationships: [] });
+//   const [twins, setTwins] = useState([]);
+//   const [models, setModels] = useState([]);
+//   const [loading, setLoading] = useState(false);
+//   const [submitting, setSubmitting] = useState(false);
+//   const [error, setError] = useState(null);
+//   const [stats, setStats] = useState(null);
+
+//   // UI state
+//   const [selectedNode, setSelectedNode] = useState(null);
+//   const [showCreateTwinForm, setShowCreateTwinForm] = useState(false);
+//   const [showCreateRelForm, setShowCreateRelForm] = useState(false);
+//   const [showDetailModal, setShowDetailModal] = useState(false);
+//   const [rootTwinId, setRootTwinId] = useState(null);
+
+//   // Form data
+//   const [twinFormData, setTwinFormData] = useState({
+//     twin_id: '',
+//     model_id: '',
+//     display_name: '',
+//     properties: '{}'
+//   });
+
+//   const [relFormData, setRelFormData] = useState({
+//     source_twin_id: '',
+//     target_twin_id: '',
+//     relationship_name: '',
+//     properties: '{}'
+//   });
+
+//   // Refs for D3
+//   const svgRef = useRef(null);
+//   const containerRef = useRef(null);
+
+//   useEffect(() => {
+//     if (selectedEnvironment) {
+//       loadData();
+//       loadStats();
+//     }
+//   }, [selectedEnvironment]);
+
+//   useEffect(() => {
+//     if (treeData.nodes.length > 0 && containerRef.current) {
+//       renderTreeGraph();
+//     }
+//   }, [treeData, selectedNode]);
+
+//   const loadData = async () => {
+//     try {
+//       setLoading(true);
+//       setError(null);
+
+//       const [treeGraphData, twinsData, modelsData] = await Promise.all([
+//         DigitalTwinAPI.getTreeGraph(selectedEnvironment.environment_id, rootTwinId),
+//         DigitalTwinAPI.getTwins(selectedEnvironment.environment_id),
+//         DigitalTwinAPI.getModels(selectedEnvironment.environment_id)
+//       ]);
+
+//       setTreeData(treeGraphData || { nodes: [], relationships: [] });
+//       setTwins(Array.isArray(twinsData) ? twinsData : []);
+//       setModels(Array.isArray(modelsData) ? modelsData : []);
+//     } catch (err) {
+//       setError('Failed to load data: ' + err.message);
+//     } finally {
+//       setLoading(false);
+//     }
+//   };
+
+//   const loadStats = async () => {
+//     try {
+//       const statsData = await DigitalTwinAPI.getRelationshipStats(selectedEnvironment.environment_id);
+//       setStats(statsData);
+//     } catch (err) {
+//       console.error('Failed to load statistics:', err);
+//     }
+//   };
+
+//   const renderTreeGraph = () => {
+//     if (!containerRef.current) return;
+
+//     const svg = d3.select(svgRef.current);
+//     svg.selectAll("*").remove();
+
+//     const containerRect = containerRef.current.getBoundingClientRect();
+//     const width = containerRect.width;
+//     const height = containerRect.height;
+
+//     svg.attr("width", width).attr("height", height);
+
+//     // Convert tree data to D3 hierarchy
+//     const hierarchyData = convertToHierarchy(treeData.nodes);
+
+//     if (!hierarchyData) {
+//       // No tree structure, render as simple list
+//       renderFlatNodeList(svg, width, height);
+//       return;
+//     }
+
+//     // Create tree layout
+//     const treeLayout = d3.tree()
+//       .size([height - 100, width - 200]);
+
+//     const root = d3.hierarchy(hierarchyData);
+//     treeLayout(root);
+
+//     const container = svg.append("g")
+//       .attr("transform", "translate(100, 50)");
+
+//     // Create zoom behavior
+//     const zoom = d3.zoom()
+//       .scaleExtent([0.1, 4])
+//       .on("zoom", (event) => {
+//         container.attr("transform", `translate(100, 50) ${event.transform}`);
+//       });
+
+//     svg.call(zoom);
+
+//     // Draw links
+//     const links = container.selectAll(".link")
+//       .data(root.links())
+//       .enter().append("path")
+//       .attr("class", "link")
+//       .attr("d", d3.linkHorizontal()
+//         .x(d => d.y)
+//         .y(d => d.x))
+//       .attr("stroke", "#999")
+//       .attr("stroke-width", 2)
+//       .attr("fill", "none");
+
+//     // Draw nodes
+//     const nodeGroups = container.selectAll(".node")
+//       .data(root.descendants())
+//       .enter().append("g")
+//       .attr("class", "node")
+//       .attr("transform", d => `translate(${d.y},${d.x})`)
+//       .style("cursor", "pointer")
+//       .on("click", handleNodeClick);
+
+//     // Node circles
+//     nodeGroups.append("circle")
+//       .attr("r", 20)
+//       .attr("fill", d => getNodeColor(d.data.metadata?.model_id))
+//       .attr("stroke", d => selectedNode?.id === d.data.id ? "#2563eb" : "#fff")
+//       .attr("stroke-width", d => selectedNode?.id === d.data.id ? 3 : 2);
+
+//     // Node labels
+//     nodeGroups.append("text")
+//       .attr("dy", "0.31em")
+//       .attr("x", d => d.children ? -25 : 25)
+//       .attr("text-anchor", d => d.children ? "end" : "start")
+//       .attr("font-size", "12px")
+//       .attr("font-weight", "500")
+//       .text(d => d.data.label || d.data.id);
+
+//     function handleNodeClick(event, d) {
+//       setSelectedNode(d.data);
+//     }
+//   };
+
+//   const renderFlatNodeList = (svg, width, height) => {
+//     // Render twins as a simple grid when no tree structure exists
+//     const twins = treeData.nodes;
+//     if (twins.length === 0) return;
+
+//     const container = svg.append("g");
+//     const nodeRadius = 25;
+//     const padding = 60;
+//     const cols = Math.floor((width - 100) / padding);
+
+//     const nodeGroups = container.selectAll(".node")
+//       .data(twins)
+//       .enter().append("g")
+//       .attr("class", "node")
+//       .attr("transform", (d, i) => {
+//         const row = Math.floor(i / cols);
+//         const col = i % cols;
+//         const x = 50 + col * padding;
+//         const y = 50 + row * padding;
+//         return `translate(${x},${y})`;
+//       })
+//       .style("cursor", "pointer")
+//       .on("click", (event, d) => setSelectedNode(d));
+
+//     // Node circles
+//     nodeGroups.append("circle")
+//       .attr("r", nodeRadius)
+//       .attr("fill", d => getNodeColor(d.metadata?.model_id))
+//       .attr("stroke", d => selectedNode?.id === d.id ? "#2563eb" : "#fff")
+//       .attr("stroke-width", d => selectedNode?.id === d.id ? 3 : 2);
+
+//     // Node labels
+//     nodeGroups.append("text")
+//       .attr("dy", nodeRadius + 15)
+//       .attr("text-anchor", "middle")
+//       .attr("font-size", "12px")
+//       .attr("font-weight", "500")
+//       .text(d => d.label || d.id);
+//   };
+
+//   const convertToHierarchy = (nodes) => {
+//     if (!nodes || nodes.length === 0) return null;
+
+//     // Simple conversion - use first node as root, others as children
+//     const rootNode = nodes[0];
+//     return {
+//       ...rootNode,
+//       children: nodes.slice(1).map(node => ({
+//         ...node,
+//         children: node.children || []
+//       }))
+//     };
+//   };
+
+//   const getNodeColor = (modelId) => {
+//     const colors = ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#06b6d4'];
+//     const modelList = [...new Set(twins.map(t => t.model_id))];
+//     const index = modelList.indexOf(modelId) % colors.length;
+//     return colors[index];
+//   };
+
+//   const handleCreateTwin = async () => {
+//     try {
+//       setSubmitting(true);
+
+//       let properties = {};
+//       if (twinFormData.properties.trim()) {
+//         try {
+//           properties = JSON.parse(twinFormData.properties);
+//         } catch (err) {
+//           throw new Error('Property JSON format error: ' + err.message);
+//         }
+//       }
+
+//       const twinData = {
+//         twin_id: twinFormData.twin_id,
+//         model_id: twinFormData.model_id,
+//         display_name: twinFormData.display_name || twinFormData.twin_id,
+//         properties: properties
+//       };
+
+//       await DigitalTwinAPI.createTwin(selectedEnvironment.environment_id, twinData);
+//       setShowCreateTwinForm(false);
+//       setTwinFormData({ twin_id: '', model_id: '', display_name: '', properties: '{}' });
+//       await loadData();
+//       await loadStats();
+//     } catch (err) {
+//       alert('Failed to create digital twin: ' + err.message);
+//     } finally {
+//       setSubmitting(false);
+//     }
+//   };
+
+//   const handleCreateRelationship = async () => {
+//     try {
+//       setSubmitting(true);
+
+//       let properties = {};
+//       if (relFormData.properties.trim()) {
+//         try {
+//           properties = JSON.parse(relFormData.properties);
+//         } catch (err) {
+//           throw new Error('Property JSON format error: ' + err.message);
+//         }
+//       }
+
+//       const relationshipData = {
+//         source_twin_id: relFormData.source_twin_id,
+//         target_twin_id: relFormData.target_twin_id,
+//         relationship_name: relFormData.relationship_name,
+//         properties: properties
+//       };
+
+//       await DigitalTwinAPI.createRelationship(selectedEnvironment.environment_id, relationshipData);
+//       setShowCreateRelForm(false);
+//       setRelFormData({ source_twin_id: '', target_twin_id: '', relationship_name: '', properties: '{}' });
+//       await loadData();
+//       await loadStats();
+//     } catch (err) {
+//       alert('Failed to create relationship: ' + err.message);
+//     } finally {
+//       setSubmitting(false);
+//     }
+//   };
+
+//   if (!selectedEnvironment) {
+//     return (
+//       <div style={styles.emptyState}>
+//         <Network style={styles.emptyStateIcon} />
+//         <p>Please select an environment first</p>
+//       </div>
+//     );
+//   }
+
+//   return (
+//     <div style={{ display: 'flex', height: 'calc(100vh - 160px)', minHeight: '600px' }}>
+//       {/* Left sidebar */}
+//       <div style={{
+//         width: '320px',
+//         minWidth: '320px',
+//         backgroundColor: '#f8fafc',
+//         borderRight: '1px solid #e2e8f0',
+//         display: 'flex',
+//         flexDirection: 'column'
+//       }}>
+//         {/* Header section */}
+//         <div style={{
+//           padding: '16px',
+//           borderBottom: '1px solid #e2e8f0',
+//           backgroundColor: '#ffffff'
+//         }}>
+//           <h2 style={{ margin: '0 0 16px 0', fontSize: '18px', fontWeight: '600' }}>
+//             Digital Twin Tree
+//           </h2>
+
+//           <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+//             <button
+//               onClick={() => setShowCreateTwinForm(true)}
+//               style={{
+//                 ...styles.primaryButton,
+//                 width: '100%',
+//                 fontSize: '12px',
+//                 padding: '8px 12px',
+//                 opacity: models.length === 0 ? 0.5 : 1
+//               }}
+//               disabled={models.length === 0}
+//             >
+//               <Plus style={{ width: '14px', height: '14px', marginRight: '6px' }} />
+//               Create Twin
+//             </button>
+
+//             <button
+//               onClick={() => setShowCreateRelForm(true)}
+//               style={{
+//                 ...styles.primaryButton,
+//                 width: '100%',
+//                 fontSize: '12px',
+//                 padding: '8px 12px',
+//                 backgroundColor: '#16a34a',
+//                 opacity: twins.length < 2 ? 0.5 : 1
+//               }}
+//               disabled={twins.length < 2}
+//             >
+//               <GitBranch style={{ width: '14px', height: '14px', marginRight: '6px' }} />
+//               Add Relationship
+//             </button>
+//           </div>
+
+//           {/* Root Twin Selector */}
+//           <div style={{ marginTop: '12px' }}>
+//             <label style={{ ...styles.formLabel, fontSize: '12px' }}>Tree Root:</label>
+//             <select
+//               value={rootTwinId || ''}
+//               onChange={(e) => {
+//                 setRootTwinId(e.target.value || null);
+//                 // Reload data with new root
+//                 setTimeout(() => loadData(), 100);
+//               }}
+//               style={{ ...styles.formInput, fontSize: '12px', padding: '6px 8px' }}
+//             >
+//               <option value="">Auto (find roots)</option>
+//               {twins.map(twin => (
+//                 <option key={twin.twin_id} value={twin.twin_id}>
+//                   {twin.twin_id}
+//                 </option>
+//               ))}
+//             </select>
+//           </div>
+//         </div>
+
+//         {/* Statistics section */}
+//         {stats && (
+//           <div style={{
+//             padding: '16px',
+//             borderBottom: '1px solid #e2e8f0',
+//             backgroundColor: '#ffffff'
+//           }}>
+//             <h3 style={{ margin: '0 0 12px 0', fontSize: '14px', fontWeight: '600' }}>
+//               Graph Statistics
+//             </h3>
+//             <div style={{ fontSize: '12px', color: '#6b7280' }}>
+//               <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '4px' }}>
+//                 <span>Digital Twins:</span>
+//                 <span style={{ fontWeight: '500', color: '#1f2937' }}>{twins.length}</span>
+//               </div>
+//               <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '4px' }}>
+//                 <span>Relationships:</span>
+//                 <span style={{ fontWeight: '500', color: '#1f2937' }}>{stats.total_relationships}</span>
+//               </div>
+//               <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '4px' }}>
+//                 <span>Connected Twins:</span>
+//                 <span style={{ fontWeight: '500', color: '#1f2937' }}>{stats.unique_twins_count}</span>
+//               </div>
+//               <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+//                 <span>Relation Types:</span>
+//                 <span style={{ fontWeight: '500', color: '#1f2937' }}>{stats.relationship_types_count}</span>
+//               </div>
+//             </div>
+//           </div>
+//         )}
+
+//         {/* Node details panel */}
+//         <div style={{ flex: 1, overflow: 'auto', padding: '16px' }}>
+//           {selectedNode ? (
+//             <div>
+//               <h3 style={{ margin: '0 0 12px 0', fontSize: '16px' }}>Selected Twin</h3>
+//               <div style={{
+//                 backgroundColor: '#ffffff',
+//                 padding: '12px',
+//                 borderRadius: '6px',
+//                 boxShadow: '0 1px 3px rgba(0,0,0,0.1)',
+//                 border: '2px solid #2563eb'
+//               }}>
+//                 <p style={{ margin: '0 0 8px 0', fontWeight: '600', color: '#2563eb' }}>{selectedNode.label || selectedNode.id}</p>
+//                 <p style={{ margin: '0 0 8px 0', fontSize: '12px', color: '#6b7280' }}>
+//                   Model: {selectedNode.metadata?.model_id || 'Unknown'}
+//                 </p>
+//                 <p style={{ margin: '0 0 12px 0', fontSize: '12px', color: '#6b7280' }}>
+//                   Type: {selectedNode.type}
+//                 </p>
+
+//                 <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+//                   <button
+//                     onClick={() => setShowDetailModal(true)}
+//                     style={{
+//                       ...styles.actionButton,
+//                       ...styles.actionButtonBlue,
+//                       fontSize: '12px',
+//                       padding: '6px 8px'
+//                     }}
+//                   >
+//                     <Eye style={{ width: '12px', height: '12px', marginRight: '4px' }} />
+//                     Details
+//                   </button>
+//                 </div>
+//               </div>
+//             </div>
+//           ) : (
+//             <div style={{ textAlign: 'center', color: '#6b7280', fontSize: '14px' }}>
+//               <Network style={{ width: '32px', height: '32px', margin: '0 auto 8px' }} />
+//               <p>Click a twin to view details</p>
+//             </div>
+//           )}
+
+//           {/* Tree structure display */}
+//           <div style={{ marginTop: '24px' }}>
+//             <h3 style={{ margin: '0 0 12px 0', fontSize: '16px' }}>
+//               Tree Structure
+//             </h3>
+//             {treeData.nodes.length === 0 ? (
+//               <p style={{ fontSize: '12px', color: '#6b7280', textAlign: 'center' }}>
+//                 No twins yet. Create twins and relationships to build the tree.
+//               </p>
+//             ) : (
+//               <div style={{ maxHeight: '300px', overflow: 'auto' }}>
+//                 {treeData.nodes.map((node, index) => (
+//                   <div key={index} style={{
+//                     ...styles.treeNodeItem,
+//                     backgroundColor: selectedNode?.id === node.id ? '#dbeafe' : '#ffffff',
+//                     borderColor: selectedNode?.id === node.id ? '#2563eb' : '#e2e8f0'
+//                   }}
+//                     onClick={() => setSelectedNode(node)}
+//                   >
+//                     <div style={{ fontWeight: '500' }}>{node.label || node.id}</div>
+//                     <div style={{ fontSize: '11px', color: '#6b7280' }}>
+//                       {node.type} • {node.metadata?.model_id || 'No model'}
+//                     </div>
+//                     {node.children && node.children.length > 0 && (
+//                       <div style={{ fontSize: '11px', color: '#16a34a', marginTop: '2px' }}>
+//                         {node.children.length} children
+//                       </div>
+//                     )}
+//                   </div>
+//                 ))}
+//               </div>
+//             )}
+//           </div>
+//         </div>
+//       </div>
+
+//       {/* Main graph area */}
+//       <div ref={containerRef} style={{ flex: 1, position: 'relative', overflow: 'hidden' }}>
+//         {error && (
+//           <div style={{
+//             ...styles.errorMessage,
+//             position: 'absolute',
+//             top: '16px',
+//             left: '16px',
+//             right: '16px',
+//             zIndex: 10
+//           }}>
+//             <span style={styles.errorText}>{error}</span>
+//             <button onClick={() => setError(null)} style={{ ...styles.closeButton, color: '#dc2626' }}>
+//               <X style={{ width: '16px', height: '16px' }} />
+//             </button>
+//           </div>
+//         )}
+
+//         {loading ? (
+//           <div style={{
+//             ...styles.loadingContainer,
+//             position: 'absolute',
+//             top: '50%',
+//             left: '50%',
+//             transform: 'translate(-50%, -50%)'
+//           }}>
+//             <div style={styles.spinner}></div>
+//             <span style={{ marginLeft: '8px', color: '#6b7280' }}>Loading tree...</span>
+//           </div>
+//         ) : treeData.nodes.length === 0 ? (
+//           <div style={{
+//             ...styles.emptyState,
+//             position: 'absolute',
+//             top: '50%',
+//             left: '50%',
+//             transform: 'translate(-50%, -50%)'
+//           }}>
+//             <Network style={styles.emptyStateIcon} />
+//             <p>No digital twins yet. Create your first twin to start building the tree.</p>
+//             {models.length === 0 && (
+//               <p style={{ color: '#f59e0b', fontSize: '14px', marginTop: '8px' }}>
+//                 ⚠️ Create models first before adding twins
+//               </p>
+//             )}
+//           </div>
+//         ) : (
+//           <div style={{ width: '100%', height: '100%', position: 'relative' }}>
+//             <svg ref={svgRef} style={{ width: '100%', height: '100%', display: 'block' }} />
+//           </div>
+//         )}
+//       </div>
+
+//       {/* Create twin modal */}
+//       <Modal
+//         isOpen={showCreateTwinForm}
+//         onClose={() => setShowCreateTwinForm(false)}
+//         title="Create New Digital Twin"
+//         size="large"
+//       >
+//         <div>
+//           <div style={styles.formGroup}>
+//             <label style={styles.formLabel}>Twin ID *</label>
+//             <input
+//               type="text"
+//               value={twinFormData.twin_id}
+//               onChange={(e) => setTwinFormData({ ...twinFormData, twin_id: e.target.value })}
+//               style={styles.formInput}
+//               placeholder="e.g. sensor_001, controller_main"
+//               required
+//             />
+//           </div>
+//           <div style={styles.formGroup}>
+//             <label style={styles.formLabel}>Display Name</label>
+//             <input
+//               type="text"
+//               value={twinFormData.display_name}
+//               onChange={(e) => setTwinFormData({ ...twinFormData, display_name: e.target.value })}
+//               style={styles.formInput}
+//               placeholder="Human-readable name (optional)"
+//             />
+//           </div>
+//           <div style={styles.formGroup}>
+//             <label style={styles.formLabel}>Select Model *</label>
+//             <select
+//               value={twinFormData.model_id}
+//               onChange={(e) => setTwinFormData({ ...twinFormData, model_id: e.target.value })}
+//               style={styles.formInput}
+//               required
+//             >
+//               <option value="">Please select a model</option>
+//               {models.map(model => (
+//                 <option key={model.model_id} value={model.model_id}>
+//                   {model.display_name} ({model.model_id})
+//                 </option>
+//               ))}
+//             </select>
+//           </div>
+//           <div style={styles.formGroup}>
+//             <label style={styles.formLabel}>Initial Property Values (JSON Format)</label>
+//             <JsonEditor
+//               value={twinFormData.properties}
+//               onChange={(value) => setTwinFormData({ ...twinFormData, properties: value })}
+//               placeholder={`{
+//   "temperature": 25.5,
+//   "status": "online",
+//   "location": {
+//     "x": 100,
+//     "y": 200
+//   }
+// }`}
+//             />
+//           </div>
+//           <div style={styles.formActions}>
+//             <button
+//               type="button"
+//               onClick={() => setShowCreateTwinForm(false)}
+//               style={styles.cancelButton}
+//               disabled={submitting}
+//             >
+//               Cancel
+//             </button>
+//             <button
+//               type="button"
+//               onClick={handleCreateTwin}
+//               style={{
+//                 ...styles.primaryButton,
+//                 opacity: (submitting || !twinFormData.twin_id || !twinFormData.model_id) ? 0.5 : 1
+//               }}
+//               disabled={submitting || !twinFormData.twin_id || !twinFormData.model_id}
+//             >
+//               {submitting ? 'Creating...' : 'Create Twin'}
+//             </button>
+//           </div>
+//         </div>
+//       </Modal>
+
+//       {/* Create relationship modal */}
+//       <Modal
+//         isOpen={showCreateRelForm}
+//         onClose={() => setShowCreateRelForm(false)}
+//         title="Create New Relationship"
+//       >
+//         <div>
+//           <div style={styles.formGroup}>
+//             <label style={styles.formLabel}>Source Twin *</label>
+//             <select
+//               value={relFormData.source_twin_id}
+//               onChange={(e) => setRelFormData({ ...relFormData, source_twin_id: e.target.value })}
+//               style={styles.formInput}
+//               required
+//             >
+//               <option value="">Select source twin</option>
+//               {twins.map(twin => (
+//                 <option key={twin.twin_id} value={twin.twin_id}>
+//                   {twin.twin_id}
+//                 </option>
+//               ))}
+//             </select>
+//           </div>
+//           <div style={styles.formGroup}>
+//             <label style={styles.formLabel}>Target Twin *</label>
+//             <select
+//               value={relFormData.target_twin_id}
+//               onChange={(e) => setRelFormData({ ...relFormData, target_twin_id: e.target.value })}
+//               style={styles.formInput}
+//               required
+//             >
+//               <option value="">Select target twin</option>
+//               {twins.filter(t => t.twin_id !== relFormData.source_twin_id).map(twin => (
+//                 <option key={twin.twin_id} value={twin.twin_id}>
+//                   {twin.twin_id}
+//                 </option>
+//               ))}
+//             </select>
+//           </div>
+//           <div style={styles.formGroup}>
+//             <label style={styles.formLabel}>Relationship Name *</label>
+//             <input
+//               type="text"
+//               value={relFormData.relationship_name}
+//               onChange={(e) => setRelFormData({ ...relFormData, relationship_name: e.target.value })}
+//               style={styles.formInput}
+//               placeholder="e.g.: connects_to, contains, controls"
+//               required
+//             />
+//           </div>
+//           <div style={styles.formGroup}>
+//             <label style={styles.formLabel}>Relationship Properties (JSON Format)</label>
+//             <JsonEditor
+//               value={relFormData.properties}
+//               onChange={(value) => setRelFormData({ ...relFormData, properties: value })}
+//               placeholder={`{
+//   "strength": 0.8,
+//   "type": "physical",
+//   "description": "Direct connection"
+// }`}
+//             />
+//           </div>
+//           <div style={styles.formActions}>
+//             <button
+//               type="button"
+//               onClick={() => setShowCreateRelForm(false)}
+//               style={styles.cancelButton}
+//               disabled={submitting}
+//             >
+//               Cancel
+//             </button>
+//             <button
+//               type="button"
+//               onClick={handleCreateRelationship}
+//               style={{
+//                 ...styles.primaryButton,
+//                 opacity: (submitting || !relFormData.source_twin_id || !relFormData.target_twin_id || !relFormData.relationship_name) ? 0.5 : 1
+//               }}
+//               disabled={submitting || !relFormData.source_twin_id || !relFormData.target_twin_id || !relFormData.relationship_name}
+//             >
+//               {submitting ? 'Creating...' : 'Create Relationship'}
+//             </button>
+//           </div>
+//         </div>
+//       </Modal>
+
+//       {/* Twin details modal */}
+//       <Modal
+//         isOpen={showDetailModal}
+//         onClose={() => setShowDetailModal(false)}
+//         title="Digital Twin Details"
+//         size="large"
+//       >
+//         {selectedNode && (
+//           <div>
+//             <div style={styles.grid2}>
+//               <div>
+//                 <label style={styles.formLabel}>Twin ID</label>
+//                 <p style={{ margin: '4px 0 0 0', fontSize: '14px', fontWeight: '500' }}>{selectedNode.id}</p>
+//               </div>
+//               <div>
+//                 <label style={styles.formLabel}>Display Name</label>
+//                 <p style={{ margin: '4px 0 0 0', fontSize: '14px' }}>{selectedNode.label || selectedNode.id}</p>
+//               </div>
+//               <div>
+//                 <label style={styles.formLabel}>Type</label>
+//                 <p style={{ margin: '4px 0 0 0', fontSize: '14px' }}>{selectedNode.type}</p>
+//               </div>
+//               <div>
+//                 <label style={styles.formLabel}>Model ID</label>
+//                 <p style={{ margin: '4px 0 0 0', fontSize: '14px' }}>{selectedNode.metadata?.model_id || 'Unknown'}</p>
+//               </div>
+//             </div>
+
+//             {/* Last Updated Time */}
+//             {selectedNode.metadata?.telemetry_last_updated && (
+//               <div style={styles.lastUpdatedBox}>
+//                 <Clock style={{ width: '16px', height: '16px', color: '#0369a1' }} />
+//                 <span style={styles.lastUpdatedText}>
+//                   Last Updated: {formatDate(selectedNode.metadata.telemetry_last_updated)}
+//                 </span>
+//               </div>
+//             )}
+
+//             {/* Properties */}
+//             <div style={{ marginTop: '24px' }}>
+//               <label style={{ ...styles.formLabel, marginBottom: '8px' }}>Properties</label>
+//               <pre style={styles.preCode}>
+//                 {JSON.stringify(selectedNode.metadata?.properties || {}, null, 2)}
+//               </pre>
+//             </div>
+
+//             {/* Children */}
+//             {selectedNode.children && selectedNode.children.length > 0 && (
+//               <div style={{ marginTop: '24px' }}>
+//                 <label style={{ ...styles.formLabel, marginBottom: '8px' }}>
+//                   Child Nodes ({selectedNode.children.length})
+//                 </label>
+//                 <div style={{ maxHeight: '150px', overflow: 'auto' }}>
+//                   {selectedNode.children.map((child, index) => (
+//                     <div key={index} style={{
+//                       backgroundColor: '#f8fafc',
+//                       padding: '8px 12px',
+//                       marginBottom: '4px',
+//                       borderRadius: '4px',
+//                       fontSize: '12px'
+//                     }}>
+//                       <strong>{child.label || child.id}</strong>
+//                       <span style={{ color: '#6b7280', marginLeft: '8px' }}>({child.type})</span>
+//                     </div>
+//                   ))}
+//                 </div>
+//               </div>
+//             )}
+//           </div>
+//         )}
+//       </Modal>
+//     </div>
+//   );
+// };
+
 // Enhanced Network Graph Visualizer - ADT Explorer style
 const TwinGraphVisualizer = ({ selectedEnvironment }) => {
   const [graphData, setGraphData] = useState({ nodes: [], relationships: [] });
@@ -2644,6 +3415,9 @@ const DeviceTwinMappingManager = ({ selectedEnvironment }) => {
   const [submitting, setSubmitting] = useState(false);
   const [showCreateForm, setShowCreateForm] = useState(false);
   const [error, setError] = useState(null);
+  const [showDetailModal, setShowDetailModal] = useState(false);
+  const [selectedEnvironment, setSelectedEnvironment] = useState(null);
+  const [editingEnvironment, setEditingEnvironment] = useState(null);
 
   const [formData, setFormData] = useState({
     device_id: '',
@@ -2885,7 +3659,6 @@ const DeviceTwinMappingManager = ({ selectedEnvironment }) => {
 
 // Main interface component (updated)
 const DigitalTwinPlatform = () => {
-  // 从localStorage恢复状态，如果没有则使用默认值
   const [activeTab, setActiveTab] = useState(() => {
     return localStorage.getItem('digitalTwin_activeTab') || 'environments';
   });
@@ -2920,26 +3693,13 @@ const DigitalTwinPlatform = () => {
       setLoading(true);
       setError(null);
       const data = await DigitalTwinAPI.getEnvironments();
-      const environmentsArray = Array.isArray(data) ? data : [];
-      setEnvironments(environmentsArray);
-      
-      // 如果当前选中的环境不存在了，清除选择
-      if (selectedEnvironment && !environmentsArray.find(env => env.environment_id === selectedEnvironment.environment_id)) {
-        setSelectedEnvironment(null);
-      }
+      setEnvironments(Array.isArray(data) ? data : []);
     } catch (err) {
       setError('Failed to load environments: ' + err.message);
       setEnvironments([]);
     } finally {
       setLoading(false);
     }
-  };
-
-  // 处理环境选择（从Environment管理页面）
-  const handleEnvironmentSelect = (environment) => {
-    setSelectedEnvironment(environment);
-    // 选择环境后自动跳转到models页面
-    setActiveTab('models');
   };
 
   const tabs = [
@@ -2962,58 +3722,22 @@ const DigitalTwinPlatform = () => {
               <Network style={styles.logo} />
               <h1 style={styles.title}>Digital Twin Platform</h1>
             </div>
-            <div style={styles.headerRight}>
-              {/* 显示当前选中的环境，只有在environments页面或没有选中环境时才显示选择器 */}
-              {activeTab === 'environments' || !selectedEnvironment ? (
-                <select
-                  style={styles.select}
-                  value={selectedEnvironment?.environment_id || ''}
-                  onChange={(e) => {
-                    const env = environments.find(env => env.environment_id === e.target.value);
-                    setSelectedEnvironment(env);
-                  }}
-                >
-                  <option value="">Select Environment</option>
-                  {environments.map(env => (
-                    <option key={env.environment_id} value={env.environment_id}>
-                      {env.display_name}
-                    </option>
-                  ))}
-                </select>
-              ) : (
-                <div style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: '12px',
-                  fontSize: '14px',
-                  color: '#6b7280'
-                }}>
-                  <span>Environment:</span>
-                  <span style={{
-                    fontSize: '14px',
-                    fontWeight: '600',
-                    color: '#2563eb',
-                    padding: '6px 12px',
-                    backgroundColor: '#dbeafe',
-                    borderRadius: '6px'
-                  }}>
-                    {selectedEnvironment.display_name}
-                  </span>
-                  <button
-                    onClick={() => setSelectedEnvironment(null)}
-                    style={{
-                      background: 'none',
-                      border: 'none',
-                      color: '#6b7280',
-                      cursor: 'pointer',
-                      padding: '4px'
-                    }}
-                    title="Change Environment"
-                  >
-                    <Settings style={{width: '16px', height: '16px'}} />
-                  </button>
-                </div>
-              )}
+            <div>
+              <select
+                style={styles.select}
+                value={selectedEnvironment?.environment_id || ''}
+                onChange={(e) => {
+                  const env = environments.find(env => env.environment_id === e.target.value);
+                  setSelectedEnvironment(env);
+                }}
+              >
+                <option value="">Select Environment</option>
+                {environments.map(env => (
+                  <option key={env.environment_id} value={env.environment_id}>
+                    {env.display_name}
+                  </option>
+                ))}
+              </select>
             </div>
           </div>
         </div>
@@ -3070,7 +3794,6 @@ const DigitalTwinPlatform = () => {
               <EnvironmentManager
                 environments={environments}
                 onEnvironmentChange={loadEnvironments}
-                onEnvironmentSelect={handleEnvironmentSelect}
                 loading={loading}
               />
             )}
@@ -3112,11 +3835,8 @@ const DigitalTwinPlatform = () => {
 };
 
 // Environment management component
-const EnvironmentManager = ({ environments, onEnvironmentChange, onEnvironmentSelect, loading }) => {
+const EnvironmentManager = ({ environments, onEnvironmentChange, loading }) => {
   const [showCreateForm, setShowCreateForm] = useState(false);
-  const [showDetailModal, setShowDetailModal] = useState(false);
-  const [selectedEnvironment, setSelectedEnvironment] = useState(null);
-  const [editingEnvironment, setEditingEnvironment] = useState(null);
   const [submitting, setSubmitting] = useState(false);
   const [formData, setFormData] = useState({
     environment_id: '',
@@ -3127,48 +3847,18 @@ const EnvironmentManager = ({ environments, onEnvironmentChange, onEnvironmentSe
   const handleSubmit = async () => {
     try {
       setSubmitting(true);
-      
-      if (editingEnvironment) {
-        // 更新环境
-        await DigitalTwinAPI.updateEnvironment(editingEnvironment.environment_id, {
-          display_name: formData.display_name,
-          description: formData.description
-        });
-      } else {
-        // 创建新环境
-        await DigitalTwinAPI.createEnvironment(formData);
-      }
-      
+      await DigitalTwinAPI.createEnvironment(formData);
       setShowCreateForm(false);
-      setEditingEnvironment(null);
       setFormData({ environment_id: '', display_name: '', description: '' });
       onEnvironmentChange();
     } catch (err) {
-      alert('Failed to ' + (editingEnvironment ? 'update' : 'create') + ' environment: ' + err.message);
+      alert('Failed to create environment: ' + err.message);
     } finally {
       setSubmitting(false);
     }
   };
 
-  const handleEdit = (environment, event) => {
-    event.stopPropagation(); // 防止触发环境选择
-    setEditingEnvironment(environment);
-    setFormData({
-      environment_id: environment.environment_id,
-      display_name: environment.display_name,
-      description: environment.description || ''
-    });
-    setShowCreateForm(true);
-  };
-
-  const handleViewDetails = (environment, event) => {
-    event.stopPropagation(); // 防止触发环境选择
-    setSelectedEnvironment(environment);
-    setShowDetailModal(true);
-  };
-
-  const handleDelete = async (envId, event) => {
-    event.stopPropagation(); // 防止触发环境选择
+  const handleDelete = async (envId) => {
     if (window.confirm('Are you sure you want to delete this environment? This will delete all related data.')) {
       try {
         await DigitalTwinAPI.deleteEnvironment(envId);
@@ -3179,22 +3869,12 @@ const EnvironmentManager = ({ environments, onEnvironmentChange, onEnvironmentSe
     }
   };
 
-  const handleEnvironmentClick = (environment) => {
-    if (onEnvironmentSelect) {
-      onEnvironmentSelect(environment);
-    }
-  };
-
   return (
     <div>
       <div style={styles.contentHeader}>
         <h2 style={styles.contentTitle}>Environment Management</h2>
         <button
-          onClick={() => {
-            setEditingEnvironment(null);
-            setFormData({ environment_id: '', display_name: '', description: '' });
-            setShowCreateForm(true);
-          }}
+          onClick={() => setShowCreateForm(true)}
           style={styles.primaryButton}
           disabled={submitting}
         >
@@ -3217,23 +3897,7 @@ const EnvironmentManager = ({ environments, onEnvironmentChange, onEnvironmentSe
         ) : (
           <div>
             {environments.map(env => (
-              <div 
-                key={env.environment_id} 
-                style={{
-                  ...styles.listItem,
-                  cursor: 'pointer',
-                  transition: 'all 0.2s'
-                }}
-                onClick={() => handleEnvironmentClick(env)}
-                onMouseEnter={(e) => {
-                  e.currentTarget.style.backgroundColor = '#f8fafc';
-                  e.currentTarget.style.borderColor = '#2563eb';
-                }}
-                onMouseLeave={(e) => {
-                  e.currentTarget.style.backgroundColor = '#ffffff';
-                  e.currentTarget.style.borderColor = '#e2e8f0';
-                }}
-              >
+              <div key={env.environment_id} style={styles.listItem}>
                 <div style={styles.itemContent}>
                   <div style={styles.itemInfo}>
                     <h3 style={styles.itemTitle}>{env.display_name}</h3>
@@ -3244,27 +3908,10 @@ const EnvironmentManager = ({ environments, onEnvironmentChange, onEnvironmentSe
                     <p style={styles.itemMeta}>
                       Created: {formatDate(env.created_at)}
                     </p>
-                    <p style={{ ...styles.itemMeta, color: '#2563eb', fontSize: '12px' }}>
-                      Click to select and continue →
-                    </p>
                   </div>
                   <div style={styles.itemActions}>
                     <button
-                      onClick={(event) => handleViewDetails(env, event)}
-                      style={{ ...styles.actionButton, ...styles.actionButtonBlue }}
-                      title="View Details"
-                    >
-                      <Eye style={styles.actionIcon} />
-                    </button>
-                    <button
-                      onClick={(event) => handleEdit(env, event)}
-                      style={{ ...styles.actionButton, ...styles.actionButtonGray }}
-                      title="Edit"
-                    >
-                      <Edit style={styles.actionIcon} />
-                    </button>
-                    <button
-                      onClick={(event) => handleDelete(env.environment_id, event)}
+                      onClick={() => handleDelete(env.environment_id)}
                       style={{ ...styles.actionButton, ...styles.actionButtonRed }}
                       title="Delete Environment"
                     >
@@ -3278,11 +3925,11 @@ const EnvironmentManager = ({ environments, onEnvironmentChange, onEnvironmentSe
         )}
       </div>
 
-      {/* Create/Edit environment modal */}
+      {/* Create environment modal */}
       <Modal
         isOpen={showCreateForm}
         onClose={() => setShowCreateForm(false)}
-        title={editingEnvironment ? "Edit Environment" : "Create New Environment"}
+        title="Create New Environment"
       >
         <div>
           <div style={styles.formGroup}>
@@ -3293,7 +3940,6 @@ const EnvironmentManager = ({ environments, onEnvironmentChange, onEnvironmentSe
               onChange={(e) => setFormData({ ...formData, environment_id: e.target.value })}
               style={styles.formInput}
               placeholder="Only letters, numbers, hyphens and underscores allowed"
-              disabled={editingEnvironment}
               required
             />
           </div>
@@ -3335,58 +3981,10 @@ const EnvironmentManager = ({ environments, onEnvironmentChange, onEnvironmentSe
               }}
               disabled={submitting || !formData.environment_id || !formData.display_name}
             >
-              {submitting ? (editingEnvironment ? 'Updating...' : 'Creating...') : (editingEnvironment ? 'Update' : 'Create')}
+              {submitting ? 'Creating...' : 'Create'}
             </button>
           </div>
         </div>
-      </Modal>
-
-      {/* Environment details modal */}
-      <Modal
-        isOpen={showDetailModal}
-        onClose={() => setShowDetailModal(false)}
-        title="Environment Details"
-        size="large"
-      >
-        {selectedEnvironment && (
-          <div>
-            <div style={styles.grid2}>
-              <div>
-                <label style={styles.formLabel}>Environment ID</label>
-                <p style={{ margin: '4px 0 0 0', fontSize: '14px', fontWeight: '500' }}>
-                  {selectedEnvironment.environment_id}
-                </p>
-              </div>
-              <div>
-                <label style={styles.formLabel}>Display Name</label>
-                <p style={{ margin: '4px 0 0 0', fontSize: '14px' }}>
-                  {selectedEnvironment.display_name}
-                </p>
-              </div>
-              <div>
-                <label style={styles.formLabel}>Created</label>
-                <p style={{ margin: '4px 0 0 0', fontSize: '14px' }}>
-                  {formatDate(selectedEnvironment.created_at)}
-                </p>
-              </div>
-              <div>
-                <label style={styles.formLabel}>Updated</label>
-                <p style={{ margin: '4px 0 0 0', fontSize: '14px' }}>
-                  {formatDate(selectedEnvironment.updated_at)}
-                </p>
-              </div>
-            </div>
-
-            {selectedEnvironment.description && (
-              <div style={{ margin: '24px 0' }}>
-                <label style={styles.formLabel}>Description</label>
-                <p style={{ margin: '4px 0 0 0', fontSize: '14px' }}>
-                  {selectedEnvironment.description}
-                </p>
-              </div>
-            )}
-          </div>
-        )}
       </Modal>
     </div>
   );
@@ -3434,30 +4032,29 @@ const ModelManager = ({ selectedEnvironment }) => {
     try {
       setSubmitting(true);
 
-      if (editingModel) {
-        // 更新模型时，不包含properties字段
-        await DigitalTwinAPI.updateModel(selectedEnvironment.environment_id, editingModel.model_id, {
-          display_name: formData.display_name,
-          description: formData.description
-        });
-      } else {
-        // 创建新模型时，需要解析properties
-        let properties = {};
-        if (formData.properties.trim()) {
-          try {
-            properties = JSON.parse(formData.properties);
-          } catch (err) {
-            throw new Error('Property definition JSON format error: ' + err.message);
-          }
+      let properties = {};
+      if (formData.properties.trim()) {
+        try {
+          properties = JSON.parse(formData.properties);
+        } catch (err) {
+          throw new Error('Property definition JSON format error: ' + err.message);
         }
+      }
 
-        const modelData = {
-          model_id: formData.model_id,
+      const modelData = {
+        model_id: formData.model_id,
+        display_name: formData.display_name,
+        description: formData.description,
+        properties: properties
+      };
+
+      if (editingModel) {
+        await DigitalTwinAPI.updateModel(selectedEnvironment.environment_id, editingModel.model_id, {
           display_name: formData.display_name,
           description: formData.description,
           properties: properties
-        };
-
+        });
+      } else {
         await DigitalTwinAPI.createModel(selectedEnvironment.environment_id, modelData);
       }
 
@@ -3638,26 +4235,11 @@ const ModelManager = ({ selectedEnvironment }) => {
             />
           </div>
           <div style={styles.formGroup}>
-            <label style={styles.formLabel}>
-              Property Definition (JSON Format)
-              {editingModel && <span style={{ color: '#6b7280', fontSize: '12px', marginLeft: '8px' }}>- Read Only</span>}
-            </label>
-            {editingModel ? (
-              // 编辑模式下显示只读的预览
-              <pre style={{
-                ...styles.preCode,
-                backgroundColor: '#f9fafb',
-                border: '1px solid #e5e7eb',
-                color: '#6b7280'
-              }}>
-                {formData.properties}
-              </pre>
-            ) : (
-              // 创建模式下显示可编辑的JsonEditor
-              <JsonEditor
-                value={formData.properties}
-                onChange={(value) => setFormData({ ...formData, properties: value })}
-                placeholder={`{
+            <label style={styles.formLabel}>Property Definition (JSON Format)</label>
+            <JsonEditor
+              value={formData.properties}
+              onChange={(value) => setFormData({ ...formData, properties: value })}
+              placeholder={`{
   "temperature": {
     "type": "number",
     "unit": "°C",
@@ -3672,13 +4254,7 @@ const ModelManager = ({ selectedEnvironment }) => {
     "default_value": "unknown"
   }
 }`}
-              />
-            )}
-            {editingModel && (
-              <p style={{ fontSize: '12px', color: '#f59e0b', marginTop: '8px' }}>
-                Properties cannot be modified after model creation. Create a new model if you need different properties.
-              </p>
-            )}
+            />
           </div>
           <div style={styles.formActions}>
             <button

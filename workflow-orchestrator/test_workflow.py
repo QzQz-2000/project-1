@@ -176,9 +176,13 @@ async def test_workflow():
                 "name": "load_data",
                 "task_type": "DATA",
                 "data_source_config": {
-                    "source_type": "csv",
+                    "source_type": "influxdb",
                     "query_config": {
-                        "file_path": "/app/data/test_data.csv"
+                        "measurement": "test_measurement",
+                        "fields": ["value"],
+                        "start": "-4h",             
+                        "stop": "now()",
+                        "pivot": True   
                     }
                 }
             },
@@ -372,14 +376,16 @@ async def test_complex_workflow():
         "description": "完整的数据预处理和异常检测流水线",
         "steps": [
             {
-                "name": "load_sample_data",
+                "name": "load_data",
                 "task_type": "DATA",
                 "data_source_config": {
-                    "source_type": "sample",
+                    "source_type": "influxdb",
                     "query_config": {
-                        "rows": 100,
-                        "data_type": "time_series",
-                        "seed": 42
+                        "measurement": "test_measurement",
+                        "fields": ["value"],
+                        "start": "-4h",             
+                        "stop": "now()",
+                        "pivot": True   
                     }
                 }
             },
@@ -391,7 +397,7 @@ async def test_complex_workflow():
                     "field": "value",
                     "method": "interpolate"
                 },
-                "dependencies": ["load_sample_data"]
+                "dependencies": ["load_data"]
             },
             {
                 "name": "moving_average",

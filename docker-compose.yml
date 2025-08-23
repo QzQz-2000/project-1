@@ -1,7 +1,6 @@
 version: '3.8'
 
 services:
-  # Kafka Ecosystem (KRaft 模式)
   broker:
     image: confluentinc/cp-server:7.9.1
     hostname: broker
@@ -124,7 +123,6 @@ services:
       KSQL_KSQL_LOGGING_PROCESSING_TOPIC_AUTO_CREATE: 'true'
       KSQL_KSQL_LOGGING_PROCESSING_STREAM_AUTO_CREATE: 'true'
 
-  # Mosquitto（来自第一个文件）
   mosquitto:
     image: eclipse-mosquitto:2.0
     container_name: mosquitto
@@ -138,7 +136,6 @@ services:
     restart: unless-stopped
     command: mosquitto -c /mosquitto-no-auth.conf
 
-  # Database services
   mongodb:
     image: mongo:6.0
     container_name: my-mongo
@@ -151,23 +148,11 @@ services:
     volumes:
       - mongo-data:/data/db
 
-  neo4j:
-    image: neo4j:5.20
-    container_name: neo4j
-    ports:
-      - "7474:7474"
-      - "7687:7687"
-    environment:
-      NEO4J_AUTH: neo4j/test1234
-    volumes:
-      - neo4j_data:/data
-
-    # 添加 Redis 服务 - 使用6380端口避免冲突
   redis:
     image: redis:7-alpine
     container_name: redis
     ports:
-      - "6380:6379"  # 宿主机6380端口映射到容器6379端口
+      - "6380:6379"
     volumes:
       - redis-data:/data
     restart: unless-stopped
@@ -192,7 +177,6 @@ services:
       DOCKER_INFLUXDB_INIT_BUCKET: mybucket
       DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: mytoken
 
-  # IoT Data Adapter（来自第一个文件）
   iot-data-adapter:
     build: ./iot-data-adapter
     container_name: iot-data-adapter
@@ -217,20 +201,20 @@ services:
       start_period: 60s
 
   kafka-influx-service:
-    build: ./kafka-influx-service # 指向你的服务目录，其中包含 Dockerfile
+    build: ./kafka-influx-service
     container_name: kafka-influx-service
     restart: always
     env_file:
-      - ./kafka-influx-service/.env # 如果 .env 文件也在服务目录里，相应调整路径
+      - ./kafka-influx-service/.env
     depends_on:
       - broker
       - influxdb
-    environment: # 确保这里有 Kafka 和 InfluxDB 连接信息
-      KAFKA_BOOTSTRAP_SERVERS: broker:29092 # 内部网络地址
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: broker:29092
       INFLUXDB_URL: http://influxdb:8086
-      INFLUXDB_TOKEN: mytoken # 替换为 .env 文件中的变量或实际值
-      INFLUXDB_ORG: myorg # 替换为 .env 文件中的变量或实际值
-      INFLUXDB_BUCKET: mybucket # 替换为 .env 文件中的变量或实际值
+      INFLUXDB_TOKEN: mytoken
+      INFLUXDB_ORG: myorg
+      INFLUXDB_BUCKET: mybucket
   
   twin-updater-service:
     build: ./twin-updater-service
@@ -240,27 +224,8 @@ services:
       - broker
       - mongodb
       - redis
-    environment:
-      # MongoDB 配置
-      MONGO_DB_URL: mongodb://admin:secret@mongodb:27017  # 包含认证信息
-      MONGO_DB_NAME: digital_twin_db
-      
-      # Kafka 配置
-      KAFKA_BOOTSTRAP_SERVERS: broker:29092
-      KAFKA_TOPIC: telemetry
-      KAFKA_GROUP_ID: twin-updater
-      KAFKA_AUTO_OFFSET_RESET: latest
-      
-      # Redis 配置 - 连接Docker Redis容器
-      REDIS_URL: redis://redis:6379  # 容器内部使用6379端口
-      
-      # API 配置
-      API_BASE_URL: http://host.docker.internal:8000
-      API_BATCH_SIZE: 50
-      API_BATCH_TIMEOUT: 5.0
-      
-      # WebSocket 通知配置
-      WEBSOCKET_NOTIFICATION_ENABLED: true
+    env_file:
+      - ./twin-updater-service/.env
 
   workflow-engine:
     build: ./workflow-orchestrator
@@ -268,12 +233,18 @@ services:
     depends_on:
       - broker
       - redis
+      - influxdb
     ports:
       - "8001:8001"
     environment:
       KAFKA_BOOTSTRAP_SERVERS: broker:29092
       REDIS_HOST: redis
       REDIS_PORT: 6379
+      
+      INFLUXDB_URL: http://influxdb:8086
+      INFLUXDB_TOKEN: mytoken
+      INFLUXDB_ORG: myorg
+      INFLUXDB_BUCKET: mybucket
     volumes:
       - ./workflow-orchestrator/data:/app/data
     restart: unless-stopped
@@ -289,16 +260,16 @@ services:
     depends_on:
       - influxdb
     environment:
-      GF_AUTH_ANONYMOUS_ENABLED: false        # 关闭匿名访问
-      GF_SECURITY_ADMIN_USER: admin           # 管理员账号
-      GF_SECURITY_ADMIN_PASSWORD: admin123    # 管理员密码
+      GF_AUTH_ANONYMOUS_ENABLED: false
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin123
 
 
 volumes:
   mongo-data:
-  neo4j_data:
   redis-data: 
   influxdb_data:
   mosquitto-data:
   mosquitto-logs:
   grafana-data:
+

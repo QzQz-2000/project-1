@@ -126,38 +126,6 @@ async def get_workflow_status(environment_id: str, workflow_id: str):
         logger.error(f"Error getting workflow status: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/environments/{environment_id}/workflows/{workflow_id}/tasks/{task_name}/result")
-async def get_task_result(environment_id: str, workflow_id: str, task_name: str):
-    """获取指定环境下特定任务的结果数据"""
-    try:
-        # 使用新的键格式，确保环境隔离
-        result_key = f"result:{environment_id}:{workflow_id}#{task_name}"
-        
-        # 使用非解码的Redis客户端读取pickle数据
-        redis_binary = redis.Redis(
-            host=config.REDIS_HOST,
-            port=config.REDIS_PORT,
-            db=config.REDIS_DB,
-            decode_responses=False
-        )
-        
-        serialized_data = await redis_binary.get(result_key)
-        await redis_binary.close()
-        
-        if not serialized_data:
-            raise HTTPException(status_code=404, detail="Task result not found")
-        
-        result_df = pickle.loads(serialized_data)
-        result_df = result_df.replace([np.inf, -np.inf], np.nan).fillna("N/A")
-        
-        return JSONResponse(content=result_df.to_dict("records"))
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error getting task result: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error")
-
 @app.get("/environments/{environment_id}/workflows")
 async def list_workflows(environment_id: str):
     """列出指定环境下的所有工作流"""

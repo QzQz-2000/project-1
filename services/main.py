@@ -1,4 +1,3 @@
-# 标准库
 import os
 import re
 import json
@@ -12,7 +11,6 @@ from enum import Enum
 from contextlib import asynccontextmanager
 from functools import lru_cache
 
-# FastAPI 相关
 from fastapi import (
     FastAPI,
     UploadFile,
@@ -43,7 +41,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# set to INFO
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -52,7 +49,6 @@ logger = logging.getLogger(__name__)
 
 # settings
 class Settings(BaseSettings):
-    # Database connections
     MONGO_URI: str = Field(default="mongodb://localhost:27017")
     MONGO_DB_NAME: str = Field(default="digital_twin_db")
     
@@ -130,6 +126,7 @@ class EnvironmentCreate(BaseModel):
     display_name: str
     description: Optional[str] = None
     
+    # auto check
     @validator('environment_id')
     def validate_environment_id(cls, v):
         return validate_identifier(v, 'environment_id')
@@ -157,7 +154,6 @@ class ModelCreate(BaseModel):
 class ModelUpdate(BaseModel):
     display_name: Optional[str] = None
     description: Optional[str] = None
-    properties: Optional[Dict[str, PropertyDefinition]] = None
 
 class Model(TimestampMixin):
     model_id: str
@@ -193,7 +189,6 @@ class Device(TimestampMixin):
     device_type: Optional[str] = None
     location: Optional[str] = None
     manufacturer: Optional[str] = None
-    telemetry_points_count: int = 0
 
 class TwinCreate(BaseModel):
     twin_id: str
@@ -218,11 +213,10 @@ class Twin(TimestampMixin):
     properties: Dict[str, Any] = Field(default_factory=dict)
     telemetry_last_updated: Optional[datetime] = None
 
-# Device-Twin Mapping - 维护设备和twin的关联关系
 class DeviceTwinMappingCreate(BaseModel):
     device_id: str
     twin_id: str
-    mapping_type: str = "direct"  # direct, indirect, virtual
+    mapping_type: str = "direct"
     description: Optional[str] = None
 
 class DeviceTwinMappingUpdate(BaseModel):
@@ -236,7 +230,6 @@ class DeviceTwinMapping(TimestampMixin):
     mapping_type: str = "direct"
     description: Optional[str] = None
 
-# Relationship - twin之间的关系
 class RelationshipCreate(BaseModel):
     source_twin_id: str
     target_twin_id: str
@@ -259,21 +252,19 @@ class Relationship(TimestampMixin):
     environment_id: str
     properties: Dict[str, Any] = Field(default_factory=dict)
 
-# 前端树状图数据结构
 class TreeNode(BaseModel):
     id: str
     label: str
-    type: str  # "twin", "device"
+    type: str
     children: List['TreeNode'] = Field(default_factory=list)
     metadata: Optional[Dict[str, Any]] = None
 
-TreeNode.model_rebuild()  # 解决前向引用问题
+TreeNode.model_rebuild()
 
 class TreeGraph(BaseModel):
     nodes: List[TreeNode]
     relationships: List[Relationship]
 
-# Response Models
 class PaginatedResponse(BaseModel, Generic[TypeVar('T')]):
     items: List[TypeVar('T')]
     total_count: int
@@ -287,7 +278,6 @@ class OperationResponse(BaseModel):
     message: str
     details: Optional[Dict[str, Any]] = None
 
-# --- Exceptions ---
 class ResourceNotFoundError(HTTPException):
     def __init__(self, resource_type: str, resource_id: str, environment_id: Optional[str] = None):
         if environment_id:
@@ -384,13 +374,11 @@ class DatabaseClients:
                 IndexModel([("environment_id", 1), ("device_id", 1)]),
                 IndexModel([("environment_id", 1), ("twin_id", 1)])
             ]),
-            # Relationships
             (self.mongo_db["relationships"], [
                 IndexModel([
                     ("environment_id", 1),
                     ("source_twin_id", 1),
-                    ("target_twin_id", 1),
-                    ("relationship_name", 1)
+                    ("target_twin_id", 1)
                 ], unique=True),
                 IndexModel([("environment_id", 1), ("source_twin_id", 1)]),
                 IndexModel([("environment_id", 1), ("target_twin_id", 1)])
@@ -401,13 +389,12 @@ class DatabaseClients:
             await collection.create_indexes(index_models)
         logger.info("MongoDB indexes created")
 
-# --- Base Service Class ---
 class BaseService(ABC):
     """Base service class with common functionality."""
     
     def __init__(self, db: AsyncIOMotorDatabase):
         self.db = db
-        self._cache = {}  # Simple cache for existence checks
+        self._cache = {}
         
     @property
     @abstractmethod
@@ -439,7 +426,6 @@ class BaseService(ABC):
         else:
             self._cache.clear()
 
-# --- Service Classes ---
 class EnvironmentService(BaseService):
     """Service for managing environments."""
     
@@ -536,7 +522,7 @@ class EnvironmentService(BaseService):
         )
 
 class DeviceService(BaseService):
-    """Service for managing devices - 仅存储基本信息."""
+    """Service for managing devices"""
     
     collection_name = "devices"
     
@@ -1021,7 +1007,7 @@ class DeviceTwinMappingService(BaseService):
         )
 
 class RelationshipService(BaseService):
-    """Service for managing relationships between twins - 优化用于树状图显示."""
+    """Service for managing relationships between twins"""
     
     collection_name = "relationships"
     
@@ -1039,16 +1025,25 @@ class RelationshipService(BaseService):
             }, limit=1) > 0:
                 raise ResourceNotFoundError("Twin", twin_id, environment_id)
         
-        # Check if relationship already exists
-        if await self.collection.count_documents({
+        # Check if any relationship already exists between these twins (bidirectional)
+        existing_relationship = await self.collection.find_one({
             "environment_id": environment_id,
-            "source_twin_id": data.source_twin_id,
-            "target_twin_id": data.target_twin_id,
-            "relationship_name": data.relationship_name
-        }, limit=1) > 0:
+            "$or": [
+                {
+                    "source_twin_id": data.source_twin_id,
+                    "target_twin_id": data.target_twin_id
+                },
+                {
+                    "source_twin_id": data.target_twin_id,
+                    "target_twin_id": data.source_twin_id
+                }
+            ]
+        })
+
+        if existing_relationship:
             raise ResourceConflictError(
                 "Relationship",
-                f"{data.relationship_name} between {data.source_twin_id} and {data.target_twin_id}",
+                f"A relationship already exists between {data.source_twin_id} and {data.target_twin_id}",
                 environment_id
             )
 
@@ -1152,24 +1147,19 @@ class RelationshipService(BaseService):
             success=True,
             message=f"Relationship '{relationship_name}' deleted successfully"
         )
-    
+
     async def get_tree_graph(self, environment_id: str, root_twin_id: Optional[str] = None) -> TreeGraph:
-        """获取用于前端树状图显示的数据结构."""
         
-        # 获取所有relationships
         cursor = self.collection.find({"environment_id": environment_id})
         relationships = [Relationship(**remove_mongo_id(doc)) async for doc in cursor]
         
-        # 获取所有twins的基本信息
         twins_cursor = self.db["twins"].find({"environment_id": environment_id})
         twins_dict = {}
         async for doc in twins_cursor:
             twin = Twin(**remove_mongo_id(doc))
             twins_dict[twin.twin_id] = twin
         
-        # 构建树状结构
         if not relationships:
-            # 如果没有关系，返回所有twins作为根节点
             nodes = []
             for twin_id, twin in twins_dict.items():
                 nodes.append(TreeNode(
@@ -1179,39 +1169,45 @@ class RelationshipService(BaseService):
                     metadata={
                         "model_id": twin.model_id,
                         "properties": twin.properties,
-                        "created_at": twin.created_at.isoformat() if twin.created_at else None
+                        "created_at": twin.created_at.isoformat() if twin.created_at else None,
+                        "telemetry_last_updated": twin.telemetry_last_updated.isoformat() if twin.telemetry_last_updated else None
                     }
                 ))
             return TreeGraph(nodes=nodes, relationships=relationships)
         
-        # 构建邻接表
         children_map = {}
-        parents_map = {}
+        all_children = set()
         
         for rel in relationships:
             if rel.source_twin_id not in children_map:
                 children_map[rel.source_twin_id] = []
             children_map[rel.source_twin_id].append(rel.target_twin_id)
-            parents_map[rel.target_twin_id] = rel.source_twin_id
+            all_children.add(rel.target_twin_id)
         
-        # 找到根节点（没有父节点的节点）
-        root_nodes = []
-        for twin_id in twins_dict.keys():
-            if twin_id not in parents_map:
-                root_nodes.append(twin_id)
+        all_twins_in_relations = set()
+        for rel in relationships:
+            all_twins_in_relations.add(rel.source_twin_id)
+            all_twins_in_relations.add(rel.target_twin_id)
         
-        # 如果指定了root_twin_id，使用它作为唯一根节点
+        root_candidates = all_twins_in_relations - all_children
+        
         if root_twin_id and root_twin_id in twins_dict:
             root_nodes = [root_twin_id]
+        else:
+            root_nodes = list(root_candidates)
+        
+        if not root_nodes and twins_dict:
+            root_nodes = [next(iter(twins_dict.keys()))]
         
         def build_tree_node(twin_id: str, visited: set) -> Optional[TreeNode]:
             if twin_id in visited:
-                return None  # 避免循环引用
+                return None
             
-            visited.add(twin_id)
             twin = twins_dict.get(twin_id)
             if not twin:
                 return None
+            
+            visited.add(twin_id)
             
             node = TreeNode(
                 id=twin_id,
@@ -1220,25 +1216,47 @@ class RelationshipService(BaseService):
                 metadata={
                     "model_id": twin.model_id,
                     "properties": twin.properties,
-                    "created_at": twin.created_at.isoformat() if twin.created_at else None
+                    "created_at": twin.created_at.isoformat() if twin.created_at else None,
+                    "telemetry_last_updated": twin.telemetry_last_updated.isoformat() if twin.telemetry_last_updated else None
                 }
             )
             
-            # 递归构建子节点
             children = children_map.get(twin_id, [])
             for child_id in children:
-                child_node = build_tree_node(child_id, visited.copy())
+                child_node = build_tree_node(child_id, visited)
                 if child_node:
                     node.children.append(child_node)
             
+            visited.remove(twin_id)
             return node
         
-        # 构建树
         tree_nodes = []
+        global_visited = set()
+        
         for root_id in root_nodes:
-            root_node = build_tree_node(root_id, set())
-            if root_node:
-                tree_nodes.append(root_node)
+            if root_id not in global_visited:
+                root_node = build_tree_node(root_id, set())
+                if root_node:
+                    tree_nodes.append(root_node)
+                    def collect_visited(node):
+                        global_visited.add(node.id)
+                        for child in node.children:
+                            collect_visited(child)
+                    collect_visited(root_node)
+        
+        for twin_id, twin in twins_dict.items():
+            if twin_id not in global_visited:
+                tree_nodes.append(TreeNode(
+                    id=twin_id,
+                    label=twin.display_name or twin_id,
+                    type="twin",
+                    metadata={
+                        "model_id": twin.model_id,
+                        "properties": twin.properties,
+                        "created_at": twin.created_at.isoformat() if twin.created_at else None,
+                        "telemetry_last_updated": twin.telemetry_last_updated.isoformat() if twin.telemetry_last_updated else None
+                    }
+                ))
         
         return TreeGraph(nodes=tree_nodes, relationships=relationships)
     
@@ -1551,7 +1569,6 @@ async def batch_update_twins(
     updates: List[Dict] = Body(..., description="Batch update data"),
     service: TwinService = Depends(get_twin_service)
 ):
-    """批量更新多个twins的属性"""
     success_count = 0
     failure_count = 0
     
@@ -1570,7 +1587,7 @@ async def batch_update_twins(
             success_count += 1
             
         except Exception as e:
-            logger.error(f"批量更新Twin失败: {e}")
+            logger.error(f"Batch update of Twin failed: {e}")
             failure_count += 1
     
     return {
