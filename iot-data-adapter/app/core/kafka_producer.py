@@ -22,11 +22,9 @@ class KafkaProducerClient:
 
     def send_data(self, data):
         try:
-            # 生成更具描述性的key，包含environment_id和device_id
             environment_id = data.get("environment_id", "unknown")
             device_id = data.get("device_id", "unknown")
             
-            # 使用environment_id和device_id组合作为key，确保同一设备的消息在同一分区
             key = f"{environment_id}:{device_id}".encode('utf-8')
             value = json.dumps(data).encode('utf-8')
             

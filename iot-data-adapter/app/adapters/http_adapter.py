@@ -8,7 +8,7 @@ router = APIRouter()
 
 @router.post("/data/http/{environment_id}/{device_id}", summary="http adapters")
 async def receive_http_data(environment_id: str, device_id: str, request: Request):
-
+    # kafka instance
     kafka_producer = router.kafka_producer
     
     try:

@@ -4,21 +4,19 @@ from config import MQTT_BROKER, MQTT_PORT
 
 logger = logging.getLogger("mqtt_adapter")
 
-# 声明全局变量，用于在 on_message 中访问 Kafka Producer 实例
+# global kafka instance
 kafka_producer_instance = None
 
 def on_connect(client, userdata, flags, rc):
-    """当客户端连接到 MQTT Broker 时调用。"""
     if rc == 0:
+        # subscribe all device data
         logger.info("Connected to MQTT Broker successfully.")
-        # 订阅所有设备数据主题
         client.subscribe("devices/+/+/data")
         logger.info("Subscribed to topic: 'devices/+/+/data'")
     else:
         logger.error(f"Failed to connect to MQTT Broker, return code: {rc}")
 
 def on_message(client, userdata, msg):
-    """当收到 MQTT 消息时调用。"""
     topic = msg.topic
     try:
         payload = msg.payload.decode('utf-8')
@@ -37,16 +35,16 @@ def on_message(client, userdata, msg):
         logger.error(f"Invalid topic format: {topic}. Expected: devices/{environment_id}/{device_id}/data")
         return
 
+    # parse the data
     parsed_data = parse_device_data(
         payload,  
         device_id=device_id,
         environment_id=environment_id,
-        source_protocol='mqtt' # 新增参数
+        source_protocol='mqtt'
     )
     
     if parsed_data:
         try:
-            # 使用全局变量访问 kafka_producer_instance
             if kafka_producer_instance:
                 kafka_producer_instance.send_data(parsed_data)
                 logger.info(f"Processed MQTT data for device {environment_id}/{device_id} and sent to Kafka.")
@@ -58,11 +56,9 @@ def on_message(client, userdata, msg):
         logger.warning(f"Failed to parse MQTT data from {topic}")
 
 def start_mqtt_loop(kp):
-    """
-    启动 MQTT 循环，并接收 Kafka Producer 实例。
-    """
+    # kafka instance
     global kafka_producer_instance
-    kafka_producer_instance = kp # 将传入的实例赋值给全局变量
+    kafka_producer_instance = kp
     
     client = mqtt.Client()
     client.on_connect = on_connect
