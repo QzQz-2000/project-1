@@ -234,6 +234,7 @@ class TaskExecutor:
                 tags=query_config.get('tags'),
                 filters=query_config.get('filters'),
                 pivot=query_config.get('pivot', True),
+                post_pivot_filters=query_config.get('post_pivot_filters'),
                 aggregation=query_config.get('aggregation'),
                 aggregate_every=query_config.get('aggregate_every'),
                 limit=query_config.get('limit')
@@ -277,15 +278,6 @@ class TaskExecutor:
         if client_key not in self._influxdb_clients:
             # 从 config 获取 InfluxDB 配置
             connection_config = config.get_default_influxdb_config()
-            
-            # 使用现有的验证方法
-            if not config.validate_influxdb_config(connection_config):
-                logger.error("InfluxDB configuration is incomplete. Please check environment variables:")
-                logger.error(f"INFLUXDB_URL: {'SET' if connection_config['url'] else 'MISSING'}")
-                logger.error(f"INFLUXDB_TOKEN: {'SET' if connection_config['token'] else 'MISSING'}")
-                logger.error(f"INFLUXDB_ORG: {'SET' if connection_config['org'] else 'MISSING'}")
-                logger.error(f"INFLUXDB_BUCKET: {'SET' if connection_config['bucket'] else 'MISSING'}")
-                return None
             
             try:
                 self._influxdb_clients[client_key] = InfluxDBDataHandler(

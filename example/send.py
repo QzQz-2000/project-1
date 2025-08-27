@@ -38,8 +38,8 @@ async def send_sensor_data(file_path: str, base_url: str, environment_id: str, d
                     # 发送当前数据
                     await post_data(session, url, json_data, headers, index, file_path)
 
-                    # 每发送一条数据暂停30秒
-                    await asyncio.sleep(1)
+                    # 每发送一条数据暂停3秒
+                    await asyncio.sleep(3)
 
                 except ValidationError as e:
                     print(f"Validation error for Data {index} from {file_path}: {e}")
@@ -74,4 +74,6 @@ if __name__ == "__main__":
 
     asyncio.run(send_sensor_data(file_path, base_url, environment_id, device_id))
 
-#python send.py ./data/sensor_Road1_Left.csv http://0.0.0.0:5000 123 sensor1
+#python send.py ./data/sensor_road1.csv http://0.0.0.0:5000 env-smart-city sensor1
+#python send.py ./data/sensor_road2.csv http://0.0.0.0:5000 env-smart-city sensor2
+#python send.py ./data/sensor_road3.csv http://0.0.0.0:5000 env-smart-city sensor3

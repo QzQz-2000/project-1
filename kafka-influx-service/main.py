@@ -17,7 +17,7 @@ from pydantic_settings import BaseSettings
 class Settings(BaseSettings):
     # Kafka
     KAFKA_TOPIC: str = "telemetry"
-    KAFKA_BOOTSTRAP_SERVERS: str = "kafka:9092"
+    KAFKA_BOOTSTRAP_SERVERS: str = "broker:9092"
     KAFKA_GROUP_ID: str
     KAFKA_AUTO_OFFSET_RESET: str = "latest"
     KAFKA_ENABLE_AUTO_COMMIT: bool = True
@@ -124,7 +124,7 @@ class InfluxWriter:
         for data in data_list:
             try:
                 point = (
-                    Point("device_telemetry")
+                    Point("telemetry")
                     .tag("device_id", data.device_id)
                     .tag("environment_id", data.environment_id)
                     .time(data.timestamp, WritePrecision.NS)

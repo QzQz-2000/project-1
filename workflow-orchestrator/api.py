@@ -29,7 +29,6 @@ kafka_producer = None
 redis_client = None
 
 async def startup():
-    """启动时初始化"""
     global kafka_producer, redis_client
     
     kafka_producer = AIOKafkaProducer(
@@ -48,7 +47,6 @@ async def startup():
     logger.info("API startup completed")
 
 async def shutdown():
-    """关闭时清理"""
     global kafka_producer, redis_client
     
     if kafka_producer:
@@ -63,7 +61,6 @@ app.add_event_handler("shutdown", shutdown)
 
 @app.post("/environments/{environment_id}/workflows/submit")
 async def submit_workflow(environment_id: str, request: WorkflowSubmissionRequest):
-    """提交工作流到指定环境"""
     try:
         workflow_id = str(uuid.uuid4())
         workflow_message = {
@@ -126,11 +123,58 @@ async def get_workflow_status(environment_id: str, workflow_id: str):
         logger.error(f"Error getting workflow status: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
+@app.get("/environments/{environment_id}/workflows/{workflow_id}/tasks/{task_name}/result")
+async def get_task_result(environment_id: str, workflow_id: str, task_name: str):
+    try:
+        # 使用新的键格式，确保环境隔离
+        result_key = f"result:{environment_id}:{workflow_id}#{task_name}"
+        
+        # 使用异步Redis客户端
+        redis_binary = redis.Redis(
+            host=config.REDIS_HOST,
+            port=config.REDIS_PORT,
+            db=config.REDIS_DB,
+            decode_responses=False
+        )
+        
+        # 异步调用，需要用await
+        serialized_data = await redis_binary.get(result_key)
+        await redis_binary.close()  # 也需要await
+        
+        if not serialized_data:
+            raise HTTPException(status_code=404, detail="Task result not found")
+        
+        result_df = pickle.loads(serialized_data)
+        result_df = result_df.replace([np.inf, -np.inf], np.nan).fillna("N/A")
+        
+        # 转换所有时间相关的列为字符串
+        for col in result_df.select_dtypes(include=['datetime', 'datetimetz']).columns:
+            result_df[col] = result_df[col].dt.strftime('%Y-%m-%d %H:%M:%S')
+        
+        # 处理可能的 Timestamp 对象
+        result_dict = result_df.to_dict("records")
+        
+        # 最后检查并转换任何剩余的 Timestamp 对象
+        import pandas as pd
+        for record in result_dict:
+            for key, value in record.items():
+                if isinstance(value, pd.Timestamp):
+                    record[key] = str(value)
+        
+        return JSONResponse(content=result_dict)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting task result: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error")
+
 @app.get("/environments/{environment_id}/workflows")
 async def list_workflows(environment_id: str):
-    """列出指定环境下的所有工作流"""
+
     try:
-        # 获取环境下所有工作流key
+
         pattern = f"workflow:{environment_id}:*"
         keys = await redis_client.keys(pattern)
         
@@ -156,7 +200,6 @@ async def list_workflows(environment_id: str):
 
 @app.delete("/environments/{environment_id}/workflows/{workflow_id}")
 async def delete_workflow(environment_id: str, workflow_id: str):
-    """删除指定环境下的工作流"""
     try:
         workflow_key = f"workflow:{environment_id}:{workflow_id}"
         
@@ -185,7 +228,6 @@ async def delete_workflow(environment_id: str, workflow_id: str):
 
 @app.get("/environments/{environment_id}/workflows/{workflow_id}/final-result")
 async def get_workflow_final_result(environment_id: str, workflow_id: str):
-    """获取工作流的最终结果（最后完成任务的结果）"""
     try:
         # 先获取工作流状态
         workflow_key = f"workflow:{environment_id}:{workflow_id}"
@@ -280,7 +322,6 @@ async def health_check():
 
 @app.get("/functions")
 async def list_functions():
-    """列出可用函数"""
     try:
         from registry import REGISTRY as function_registry
         return {
@@ -293,7 +334,6 @@ async def list_functions():
 # 添加环境管理端点
 @app.get("/environments")
 async def list_environments():
-    """列出所有环境"""
     try:
         pattern = "workflow:*"
         keys = await redis_client.keys(pattern)
@@ -312,7 +352,6 @@ async def list_environments():
 
 @app.get("/environments/{environment_id}/status")
 async def get_environment_status(environment_id: str):
-    """获取环境状态统计"""
     try:
         pattern = f"workflow:{environment_id}:*"
         keys = await redis_client.keys(pattern)

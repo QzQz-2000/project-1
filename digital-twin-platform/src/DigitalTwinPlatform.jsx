@@ -480,7 +480,7 @@ if (typeof document !== 'undefined') {
   document.head.appendChild(style);
 }
 
-// Date formatting helper function
+// Date formatting helper function (Netherlands local time)
 const formatDate = (dateString) => {
   if (!dateString) return 'Unknown';
 
@@ -497,18 +497,21 @@ const formatDate = (dateString) => {
       return 'Invalid Format';
     }
 
-    return date.toLocaleString('en-US', {
+    return date.toLocaleString('nl-NL', {
+      timeZone: 'Europe/Amsterdam', // 强制荷兰时间
       year: 'numeric',
       month: '2-digit',
       day: '2-digit',
       hour: '2-digit',
-      minute: '2-digit'
+      minute: '2-digit',
+      second: '2-digit'
     });
   } catch (error) {
     console.error('Date formatting error:', error);
     return 'Parse Error';
   }
 };
+
 
 const GrafanaDashboard = ({ selectedEnvironment }) => {
   const [dashboardUrl] = useState(
@@ -627,9 +630,9 @@ class WorkflowAPI {
     return this.request(`/environments/${environmentId}/workflows/${workflowId}/status`);
   }
 
-  static async getTaskResult(environmentId, workflowId, taskName) {
-    return this.request(`/environments/${environmentId}/workflows/${workflowId}/tasks/${taskName}/result`);
-  }
+  // static async getTaskResult(environmentId, workflowId, taskName) {
+  //   return this.request(`/environments/${environmentId}/workflows/${workflowId}/tasks/${taskName}/result`);
+  // }
 
   static async listWorkflows(environmentId) {
     return this.request(`/environments/${environmentId}/workflows`);
@@ -651,6 +654,10 @@ class WorkflowAPI {
 
   static async getWorkflowFinalResult(environmentId, workflowId) {
     return this.request(`/environments/${environmentId}/workflows/${workflowId}/final-result`);
+  }
+
+  static async getTaskResult(environmentId, workflowId, taskName) {
+    return this.request(`/environments/${environmentId}/workflows/${workflowId}/tasks/${taskName}/result`);
   }
 }
 
@@ -952,6 +959,11 @@ const WorkflowManager = ({ selectedEnvironment }) => {
   const [error, setError] = useState(null);
   const [loadingResult, setLoadingResult] = useState(false);
 
+  const [showTaskResultModal, setShowTaskResultModal] = useState(false); // New modal for task results
+  const [selectedTask, setSelectedTask] = useState(null); // New state for selected task
+  const [taskResultData, setTaskResultData] = useState(null); // New state for task result data
+  const [loadingTaskResult, setLoadingTaskResult] = useState(false); // New loading state for task results
+
   // 简化的表单数据 - 只需要一个JSON字符串
   const [workflowFormData, setWorkflowFormData] = useState({
     workflowJson: JSON.stringify({
@@ -1170,6 +1182,31 @@ const WorkflowManager = ({ selectedEnvironment }) => {
       setLoadingResult(false);
     }
   };
+  // 新增：查看单个任务结果
+  const handleViewTaskResult = async (task) => {
+    try {
+      setLoadingTaskResult(true);
+      setSelectedTask(task);
+      setTaskResultData(null);
+      setShowTaskResultModal(true);
+
+      // 调用API获取任务结果
+      const resultData = await WorkflowAPI.getTaskResult(
+        selectedEnvironment.environment_id,
+        selectedWorkflow.workflow_id,
+        task.name
+      );
+
+      setTaskResultData(resultData);
+    } catch (err) {
+      console.error('Failed to load task result:', err);
+      setTaskResultData({
+        error: 'Failed to load task result: ' + err.message
+      });
+    } finally {
+      setLoadingTaskResult(false);
+    }
+  };
 
   const handleDeleteWorkflow = async (workflowId) => {
     if (window.confirm('Are you sure you want to delete this workflow?')) {
@@ -1255,8 +1292,25 @@ const WorkflowManager = ({ selectedEnvironment }) => {
                       <p style={styles.itemDescription}>{workflow.description}</p>
                     )}
                     <p style={styles.itemMeta}>
-                      Created: {formatDate(workflow.created_at)}
-                    </p>
+                    Created: {(() => {
+                      try {
+                        const timeString = workflow.created_at;
+                        const utcTimeString = timeString.endsWith('Z') ? timeString : timeString + 'Z';
+                        const utcDate = new Date(utcTimeString);
+                        return utcDate.toLocaleString('en-US', {
+                          timeZone: 'Europe/Amsterdam',
+                          month: '2-digit',
+                          day: '2-digit',
+                          hour: 'numeric',
+                          minute: '2-digit',
+                          hour12: true
+                        });
+                      } catch (error) {
+                        console.error('Date formatting error:', error);
+                        return 'Invalid Date';
+                      }
+                    })()}
+                  </p>
                     {workflow.task_statistics && (
                       <div style={{ marginTop: '8px' }}>
                         <span style={{ fontSize: '12px', color: '#6b7280' }}>
@@ -1475,7 +1529,7 @@ const WorkflowManager = ({ selectedEnvironment }) => {
               </div>
             )}
 
-            {/* 任务进度 */}
+            {/* 任务进度
             {selectedWorkflow.tasks && (
               <div style={{ marginTop: '24px' }}>
                 <label style={{ ...styles.formLabel, marginBottom: '8px' }}>
@@ -1518,6 +1572,71 @@ const WorkflowManager = ({ selectedEnvironment }) => {
                   ))}
                 </div>
               </div>
+            )} */}
+            
+            {/* 任务进度 - 增强版，包含查看结果按钮 */}
+            {selectedWorkflow.tasks && (
+              <div style={{ marginTop: '24px' }}>
+                <label style={{ ...styles.formLabel, marginBottom: '8px' }}>
+                  Task Progress ({selectedWorkflow.tasks.length} tasks)
+                </label>
+                <div style={{ maxHeight: '400px', overflow: 'auto' }}>
+                  {selectedWorkflow.tasks.map((task, index) => (
+                    <div key={index} style={{
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      alignItems: 'center',
+                      padding: '12px',
+                      marginBottom: '8px',
+                      backgroundColor: '#f8fafc',
+                      borderRadius: '6px',
+                      fontSize: '14px',
+                      border: '1px solid #e2e8f0'
+                    }}>
+                      <div style={{ flex: 1 }}>
+                        <div style={{ fontWeight: '500', marginBottom: '4px' }}>{task.name}</div>
+                        <div style={{ fontSize: '12px', color: '#6b7280' }}>
+                          Type: {task.task_type}
+                          {task.function_name && ` • Function: ${task.function_name}`}
+                        </div>
+                        {task.dependencies && task.dependencies.length > 0 && (
+                          <div style={{ fontSize: '12px', color: '#6b7280', marginTop: '4px' }}>
+                            Dependencies: {task.dependencies.map(dep => dep.split('#').pop()).join(', ')}
+                          </div>
+                        )}
+                      </div>
+                      
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                        {/* 查看任务结果按钮 */}
+                        <button
+                          onClick={() => handleViewTaskResult(task)}
+                          style={{
+                            ...styles.actionButton,
+                            ...styles.actionButtonBlue,
+                            padding: '4px 8px',
+                            fontSize: '11px',
+                            opacity: task.status === 'completed' ? 1 : 0.5
+                          }}
+                          title={task.status === 'completed' ? "View Task Result" : "Task not completed"}
+                          disabled={task.status !== 'completed'}
+                        >
+                          <FileText style={{ width: '12px', height: '12px' }} />
+                          View Result
+                        </button>
+                        
+                        <span style={{
+                          ...styles.badge,
+                          ...(task.status === 'completed' ? styles.badgeGreen :
+                            task.status === 'failed' ? styles.badgeRed :
+                              task.status === 'running' ? styles.badgeBlue : styles.badgeGray)
+                        }}>
+                          {task.status}
+                        </span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
             )}
 
             {/* 任务统计 */}
@@ -1545,6 +1664,166 @@ const WorkflowManager = ({ selectedEnvironment }) => {
                 </div>
               </div>
             )}
+          </div>
+        )}
+      </Modal>
+
+      {/* 新增：任务结果模态框 */}
+      <Modal
+        isOpen={showTaskResultModal}
+        onClose={() => setShowTaskResultModal(false)}
+        title={`Task Result: ${selectedTask?.name}`}
+        size="large"
+      >
+        {selectedTask && (
+          <div>
+            {/* 任务基础信息 */}
+            <div style={styles.grid3}>
+              <div>
+                <label style={styles.formLabel}>Task Name</label>
+                <p style={{ margin: '4px 0 0 0', fontSize: '14px', fontWeight: '500' }}>
+                  {selectedTask.name}
+                </p>
+              </div>
+              <div>
+                <label style={styles.formLabel}>Task Type</label>
+                <p style={{ margin: '4px 0 0 0', fontSize: '14px' }}>
+                  {selectedTask.task_type}
+                  {selectedTask.function_name && ` (${selectedTask.function_name})`}
+                </p>
+              </div>
+              <div>
+                <label style={styles.formLabel}>Status</label>
+                <span style={{
+                  ...styles.badge,
+                  ...(selectedTask.status === 'completed' ? styles.badgeGreen :
+                    selectedTask.status === 'failed' ? styles.badgeRed :
+                      selectedTask.status === 'running' ? styles.badgeBlue : styles.badgeGray)
+                }}>
+                  {selectedTask.status}
+                </span>
+              </div>
+            </div>
+
+            {/* 依赖关系 */}
+            {selectedTask.dependencies && selectedTask.dependencies.length > 0 && (
+              <div style={{ marginTop: '16px' }}>
+                <label style={styles.formLabel}>Dependencies</label>
+                <div style={{ display: 'flex', gap: '8px', marginTop: '4px', flexWrap: 'wrap' }}>
+                  {selectedTask.dependencies.map((dep, index) => (
+                    <span key={index} style={{ ...styles.badge, ...styles.badgeGray }}>
+                      {dep.split('#').pop()}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* 任务结果数据 */}
+            <div style={{ marginTop: '24px' }}>
+              {loadingTaskResult ? (
+                <div style={{ ...styles.loadingContainer, margin: '40px 0' }}>
+                  <div style={styles.spinner}></div>
+                  <span style={{ marginLeft: '8px', color: '#6b7280' }}>Loading task result...</span>
+                </div>
+              ) : taskResultData?.error ? (
+                <div style={{
+                  ...styles.errorMessage,
+                  margin: '20px 0'
+                }}>
+                  <span style={styles.errorText}>{taskResultData.error}</span>
+                </div>
+              ) : taskResultData && Array.isArray(taskResultData) ? (
+                <div>
+                  {/* 结果摘要和下载按钮 */}
+                  <div style={{
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    alignItems: 'center',
+                    marginBottom: '16px'
+                  }}>
+                    <label style={styles.formLabel}>Task Result Data</label>
+                    <button
+                      onClick={() => downloadCSV(
+                        taskResultData,
+                        `${selectedWorkflow.name.replace(/[^a-zA-Z0-9]/g, '_')}_${selectedTask.name}_result.csv`
+                      )}
+                      style={{
+                        ...styles.primaryButton,
+                        backgroundColor: '#16a34a',
+                        fontSize: '12px',
+                        padding: '6px 12px'
+                      }}
+                    >
+                      <Download style={{ width: '14px', height: '14px', marginRight: '4px' }} />
+                      Download CSV
+                    </button>
+                  </div>
+
+                  <div style={{
+                    backgroundColor: '#f0f9ff',
+                    border: '1px solid #0ea5e9',
+                    borderRadius: '6px',
+                    padding: '12px',
+                    fontSize: '14px',
+                    marginBottom: '16px'
+                  }}>
+                    <div style={{ display: 'flex', gap: '24px', flexWrap: 'wrap' }}>
+                      <span><strong>Rows:</strong> {taskResultData.length}</span>
+                      <span><strong>Columns:</strong> {taskResultData.length > 0 ? Object.keys(taskResultData[0]).length : 0}</span>
+                    </div>
+                    {taskResultData.length > 0 && (
+                      <div style={{ marginTop: '8px' }}>
+                        <strong>Columns:</strong> {Object.keys(taskResultData[0]).join(', ')}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* 数据表格 */}
+                  <div style={{
+                    maxHeight: '400px',
+                    overflow: 'auto',
+                    border: '1px solid #e2e8f0',
+                    borderRadius: '6px'
+                  }}>
+                    <table style={{ width: '100%', fontSize: '12px', borderCollapse: 'collapse' }}>
+                      <thead style={{ backgroundColor: '#f8fafc', position: 'sticky', top: 0 }}>
+                        <tr>
+                          {taskResultData.length > 0 && Object.keys(taskResultData[0]).map(col => (
+                            <th key={col} style={{
+                              padding: '8px',
+                              textAlign: 'left',
+                              borderBottom: '1px solid #e2e8f0',
+                              fontWeight: '600'
+                            }}>
+                              {col}
+                            </th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {taskResultData.slice(0, 100).map((row, index) => (
+                          <tr key={index} style={{ borderBottom: '1px solid #f3f4f6' }}>
+                            {Object.values(row).map((value, colIndex) => (
+                              <td key={colIndex} style={{ padding: '6px 8px' }}>
+                                {typeof value === 'boolean' ? (value ? 'true' : 'false') :
+                                  typeof value === 'object' && value !== null ? JSON.stringify(value) :
+                                    String(value)}
+                              </td>
+                            ))}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                    {taskResultData.length > 100 && (
+                      <div style={{ padding: '8px', textAlign: 'center', fontSize: '12px', color: '#6b7280' }}>
+                        Showing first 100 rows of {taskResultData.length} total rows
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ) : null}
+            </div>
           </div>
         )}
       </Modal>
@@ -2175,10 +2454,10 @@ const TwinGraphVisualizer = ({ selectedEnvironment }) => {
                 <span>Relationships:</span>
                 <span style={{ fontWeight: '500', color: '#1f2937' }}>{stats.total_relationships}</span>
               </div>
-              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '4px' }}>
-                <span>Connected Twins:</span>
+              {/* <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '4px' }}>
+                <span>Twins :</span>
                 <span style={{ fontWeight: '500', color: '#1f2937' }}>{stats.unique_twins_count}</span>
-              </div>
+              </div> */}
               <div style={{ display: 'flex', justifyContent: 'space-between' }}>
                 <span>Relation Types:</span>
                 <span style={{ fontWeight: '500', color: '#1f2937' }}>{stats.relationship_types_count}</span>
@@ -2611,12 +2890,37 @@ const TwinGraphVisualizer = ({ selectedEnvironment }) => {
               </div>
             </div>
 
+            {/* Last Updated Time
+            {selectedNode.metadata?.telemetry_last_updated && (
+              <div style={styles.lastUpdatedBox}>
+                <Clock style={{ width: '16px', height: '16px', color: '#0369a1' }} />
+                <span style={styles.lastUpdatedText}>
+                  Last Updated: {selectedNode.metadata.telemetry_last_updated}
+                </span>
+              </div>
+            )} */}
             {/* Last Updated Time */}
             {selectedNode.metadata?.telemetry_last_updated && (
               <div style={styles.lastUpdatedBox}>
                 <Clock style={{ width: '16px', height: '16px', color: '#0369a1' }} />
                 <span style={styles.lastUpdatedText}>
-                  Last Updated: {formatDate(selectedNode.metadata.telemetry_last_updated)}
+                  Last Updated: {(() => {
+                    try {
+                      const timeString = selectedNode.metadata.telemetry_last_updated;
+                      const utcTimeString = timeString.endsWith('Z') ? timeString : timeString + 'Z';
+                      const utcDate = new Date(utcTimeString);
+                      return utcDate.toLocaleString('en-US', {
+                        timeZone: 'Europe/Amsterdam',
+                        month: '2-digit',
+                        day: '2-digit',
+                        hour: 'numeric',
+                        minute: '2-digit',
+                        hour12: true
+                      });
+                    } catch (error) {
+                      return selectedNode.metadata.telemetry_last_updated;
+                    }
+                  })()}
                 </span>
               </div>
             )}
@@ -4121,12 +4425,12 @@ const DeviceManager = ({ selectedEnvironment }) => {
                 <label style={styles.formLabel}>Updated</label>
                 <p style={{ margin: '4px 0 0 0', fontSize: '14px' }}>{formatDate(selectedDevice.updated_at)}</p>
               </div>
-              <div>
+              {/* <div>
                 <label style={styles.formLabel}>Last Seen</label>
                 <p style={{ margin: '4px 0 0 0', fontSize: '14px' }}>
                   {selectedDevice.last_seen ? formatDate(selectedDevice.last_seen) : 'Never'}
                 </p>
-              </div>
+              </div> */}
             </div>
 
             {selectedDevice.description && (
@@ -4136,7 +4440,7 @@ const DeviceManager = ({ selectedEnvironment }) => {
               </div>
             )}
 
-            <div style={{ marginTop: '24px' }}>
+            {/* <div style={{ marginTop: '24px' }}>
               <label style={styles.formLabel}>Telemetry Statistics</label>
               <div style={{
                 backgroundColor: '#f8fafc',
@@ -4149,7 +4453,7 @@ const DeviceManager = ({ selectedEnvironment }) => {
                   <span style={{ fontWeight: '500' }}>{selectedDevice.telemetry_points_count || 0}</span>
                 </div>
               </div>
-            </div>
+            </div> */}
           </div>
         )}
       </Modal>

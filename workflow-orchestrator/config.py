@@ -5,11 +5,11 @@ class Config:
     """Workflow Engine Configuration Class"""
     
     # Kafka Settings
-    KAFKA_BOOTSTRAP_SERVERS = os.getenv('KAFKA_BOOTSTRAP_SERVERS', 'localhost:9092')
+    KAFKA_BOOTSTRAP_SERVERS = os.getenv('KAFKA_BOOTSTRAP_SERVERS', 'broker:29092')
     
     # Redis Settings
     REDIS_HOST = os.getenv('REDIS_HOST', 'localhost')
-    REDIS_PORT = int(os.getenv('REDIS_PORT', 6379))
+    REDIS_PORT = int(os.getenv('REDIS_PORT', 6380))
     REDIS_DB = int(os.getenv('REDIS_DB', 0))
     
     # Application Settings
@@ -33,6 +33,12 @@ class Config:
     ALLOWED_FILE_PATHS = os.getenv('ALLOWED_FILE_PATHS', '/app/data,/tmp').split(',')  # Allowed file paths
     MAX_FILE_SIZE_MB = int(os.getenv('MAX_FILE_SIZE_MB', 100))  # Maximum file size limit
     
+    # New: InfluxDB Settings 💡
+    INFLUXDB_URL = os.getenv('INFLUXDB_URL', 'http://localhost:8086')
+    INFLUXDB_TOKEN = os.getenv('INFLUXDB_TOKEN', 'mytoken')
+    INFLUXDB_ORG = os.getenv('INFLUXDB_ORG', 'myorg')
+    INFLUXDB_BUCKET = os.getenv('INFLUXDB_BUCKET', 'mybucket')
+    
     # Kafka Topics
     TOPICS = {
         'WORKFLOW_SUBMIT': 'workflow.submit',
@@ -53,8 +59,12 @@ class Config:
             'description': 'Sample data generator',
             'required_params': ['rows'],
             'optional_params': ['data_type', 'seed', 'columns']
+        },
+        'influxdb': {
+            'description': 'InfluxDB data source',
+            'required_params': ['query'],
+            'optional_params': ['bucket', 'org']
         }
-        # Can be extended to support more data source types, such as databases, APIs, etc.
     }
     
     # New: Function Execution Environment Settings
@@ -101,7 +111,29 @@ class Config:
         """Gets Kafka configuration"""
         return {
             'bootstrap_servers': cls.KAFKA_BOOTSTRAP_SERVERS,
-            'client_id': 'workflow_engine'
+            'client_id': 'workflow_engine',
+            'group_id': 'workflow_engine_group',
+            'auto_offset_reset': 'latest'
+        }
+    
+    @classmethod
+    def get_influxdb_config(cls) -> Dict[str, str]:
+        """Gets InfluxDB configuration"""
+        return {
+            'url': cls.INFLUXDB_URL,
+            'token': cls.INFLUXDB_TOKEN,
+            'org': cls.INFLUXDB_ORG,
+            'bucket': cls.INFLUXDB_BUCKET
+        }
+
+    @classmethod
+    def get_default_influxdb_config(cls) -> Dict[str, str]:
+        """Gets default InfluxDB configuration"""
+        return {
+            'url': cls.INFLUXDB_URL,
+            'token': cls.INFLUXDB_TOKEN,
+            'org': cls.INFLUXDB_ORG,
+            'bucket': cls.INFLUXDB_BUCKET
         }
     
     @classmethod
@@ -113,10 +145,11 @@ class Config:
     @classmethod
     def print_config(cls):
         """Prints current configuration (for debugging)"""
-        print("=== Workflow Engine Configuration ==E")
+        print("=== Workflow Engine Configuration ===")
         print(f"API Port: {cls.API_PORT}")
         print(f"Redis: {cls.REDIS_HOST}:{cls.REDIS_PORT}/{cls.REDIS_DB}")
         print(f"Kafka: {cls.KAFKA_BOOTSTRAP_SERVERS}")
+        print(f"InfluxDB: {cls.INFLUXDB_URL}, Org: {cls.INFLUXDB_ORG}, Bucket: {cls.INFLUXDB_BUCKET}")
         print(f"Data TTL: {cls.DATA_TTL} seconds")
         print(f"Max Workflow Tasks: {cls.MAX_WORKFLOW_TASKS}")
         print(f"Task Timeout: {cls.TASK_TIMEOUT} seconds")

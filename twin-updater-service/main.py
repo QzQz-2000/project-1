@@ -23,7 +23,7 @@ class BatchUpdateItem(BaseModel):
     twin_id: str
     environment_id: str
     properties: Dict[str, Union[int, float, str, bool, None]]
-    timestamp: datetime
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class TelemetryMessage(BaseModel):
@@ -43,9 +43,15 @@ class TelemetryMessage(BaseModel):
         # Handle timestamp string parsing
         if 'timestamp' in kwargs and isinstance(kwargs['timestamp'], str):
             try:
-                kwargs['timestamp'] = datetime.fromisoformat(kwargs['timestamp'].replace('Z', '+00:00'))
+                # Parse timestamp string and ensure it's in UTC
+                parsed_time = datetime.fromisoformat(kwargs['timestamp'].replace('Z', '+00:00'))
+                # Convert to UTC if it has timezone info, otherwise assume it's UTC
+                if parsed_time.tzinfo is not None:
+                    kwargs['timestamp'] = parsed_time.astimezone(timezone.utc)
+                else:
+                    kwargs['timestamp'] = parsed_time.replace(tzinfo=timezone.utc)
             except ValueError:
-                # If parsing fails, use current time
+                # If parsing fails, use current UTC time
                 kwargs['timestamp'] = datetime.now(timezone.utc)
         super().__init__(**kwargs)
 
@@ -57,11 +63,11 @@ class Metrics:
         self.twins_updated = 0
         self.update_failures = 0
         self.notifications_sent = 0
-        self.start_time = datetime.now()
+        self.start_time = datetime.now(timezone.utc)  # 使用 UTC 时间
     
     def log_status(self):
         """Output status statistics"""
-        uptime = datetime.now() - self.start_time
+        uptime = datetime.now(timezone.utc) - self.start_time  # 使用 UTC 时间计算
         logger.info(f"Metrics - Uptime: {uptime}, Messages Consumed: {self.messages_consumed}, "
                    f"Twins Updated: {self.twins_updated}, Failures: {self.update_failures}, "
                    f"Notifications Sent: {self.notifications_sent}")
@@ -80,7 +86,7 @@ class WebSocketNotificationService:
         if not self.enabled:
             return
         try:
-            # Normalize timestamp
+            # Normalize timestamp to UTC
             if timestamp.tzinfo is not None:
                 utc_timestamp = timestamp.astimezone(timezone.utc)
             else:
@@ -346,14 +352,13 @@ class OptimizedTwinUpdaterService:
         if not batch:
             return
         
-        logger.info("Using corrected timestamp formatting!")  # clear marker
+        logger.info("Using unified UTC timestamp formatting with Z suffix!")
             
         # Prepare batch update data
         batch_updates = []
         for twin_id, data in batch.items():
-            # Reliable timestamp formatting
+            # Unified timestamp formatting - ensure UTC and Z suffix
             timestamp = data["timestamp"]
-            # Convert to UTC and format as ISO string with Z suffix
             if timestamp.tzinfo is not None:
                 utc_timestamp = timestamp.astimezone(timezone.utc)
             else:
@@ -367,7 +372,7 @@ class OptimizedTwinUpdaterService:
                 "telemetry_last_updated": timestamp_str
             })
             
-        logger.info(f"Corrected timestamp example: {batch_updates[0]['telemetry_last_updated'] if batch_updates else 'N/A'}")
+        logger.info(f"Unified timestamp example: {batch_updates[0]['telemetry_last_updated'] if batch_updates else 'N/A'}")
         
         # Call batch update API
         url = f"{self.api_base_url}/environments/{environment_id}/twins/batch-update"
@@ -452,7 +457,7 @@ class OptimizedTwinUpdaterService:
                 status = {
                     "service": "twin_updater",
                     "status": "running",
-                    "uptime_seconds": int((datetime.now() - self.metrics.start_time).total_seconds()),
+                    "uptime_seconds": int((datetime.now(timezone.utc) - self.metrics.start_time).total_seconds()),
                     "metrics": {
                         "messages_consumed": self.metrics.messages_consumed,
                         "twins_updated": self.metrics.twins_updated,

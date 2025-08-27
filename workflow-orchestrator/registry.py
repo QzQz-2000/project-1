@@ -11,12 +11,12 @@ logger = logging.getLogger(__name__)
 
 class FunctionCategory(Enum):
     """函数分类"""
-    TRANSFORM = "transform"      # 数据变换
-    ANALYSIS = "analysis"        # 数据分析
-    FILTER = "filter"           # 数据过滤
-    ALARM = "alarm"             # 告警
-    AGGREGATION = "aggregation" # 聚合
-    IO = "io"                   # 输入输出
+    TRANSFORM = "transform"
+    ANALYSIS = "analysis"
+    FILTER = "filter"
+    ALARM = "alarm"
+    AGGREGATION = "aggregation"
+    IO = "io"
 
 class FunctionMetadata:
     """函数元数据"""
@@ -692,144 +692,3 @@ class BandPassFilterFunction(BaseFunction):
             result[output_field] = result[field]
         
         return result
-
-# --- 使用示例 ---
-if __name__ == "__main__":
-    # 创建测试数据
-    dates = pd.date_range('2024-01-01', periods=100, freq='1min')
-    test_data = pd.DataFrame({
-        'time': dates,
-        'value': np.random.randn(100) * 10 + 50 + 5 * np.sin(np.arange(100) * 0.1),  # 添加周期性
-        'category': np.random.choice(['A', 'B'], 100)
-    })
-    test_data.loc[10:15, 'value'] = np.nan  # 添加一些缺失值
-    test_data.loc[50:52, 'value'] = 120  # 添加一些异常值
-    
-    print("Original data shape:", test_data.shape)
-    print("Missing values:", test_data['value'].isna().sum())
-    
-    # 1. 填充缺失值
-    filled_data, _ = REGISTRY.execute("FillNA", test_data, {
-        "field": "value",
-        "method": "interpolate"
-    })
-    print("After filling NA:", filled_data['value'].isna().sum())
-    
-    # 2. 计算移动平均（多种方法）
-    ma_data, _ = REGISTRY.execute("MovingAverage", filled_data, {
-        "field": "value",
-        "window": 5,
-        "method": "exponential",
-        "alpha": 0.3
-    })
-    print("After moving average:", ma_data.columns.tolist())
-    
-    # 3. 计算标准差
-    std_data, _ = REGISTRY.execute("StdDeviation", ma_data, {
-        "field": "value",
-        "window": 10
-    })
-    print("After std calculation:", std_data.columns.tolist())
-    
-    # 4. 数据归一化
-    norm_data, _ = REGISTRY.execute("Normalize", std_data, {
-        "field": "value",
-        "method": "zscore"
-    })
-    print("After normalization:", norm_data.columns.tolist())
-    
-    # 5. Z-Score异常检测
-    zscore_data, _ = REGISTRY.execute("ZScore", norm_data, {
-        "field": "value",
-        "threshold": 2.0
-    })
-    zscore_anomalies = zscore_data['is_anomaly'].sum()
-    print(f"Z-Score anomalies: {zscore_anomalies}")
-    
-    # 6. IQR异常检测
-    iqr_data, _ = REGISTRY.execute("IQRAnomaly", zscore_data, {
-        "field": "value",
-        "k": 1.5
-    })
-    iqr_anomalies = iqr_data['is_outlier'].sum()
-    print(f"IQR anomalies: {iqr_anomalies}")
-    
-    # 7. 阈值告警
-    alarm_data, _ = REGISTRY.execute("ThresholdAlarm", iqr_data, {
-        "field": "value_norm",
-        "threshold": 1.5,
-        "mode": "greater"
-    })
-    alarm_count = alarm_data['is_alarm'].sum()
-    print(f"Threshold alarms: {alarm_count}")
-    
-    # 8. 变化率告警
-    rate_alarm_data, _ = REGISTRY.execute("RateOfChangeAlarm", alarm_data, {
-        "field": "value",
-        "rate_threshold": 15.0,
-        "rate_type": "absolute"
-    })
-    rate_alarms = rate_alarm_data['rate_alarm'].sum()
-    print(f"Rate of change alarms: {rate_alarms}")
-    
-    # 9. 组合告警
-    combined_alarm_data, _ = REGISTRY.execute("CombinedAlarm", rate_alarm_data, {
-        "conditions": [
-            {"field": "value", "operator": "gt", "value": 70},
-            {"field": "is_anomaly", "operator": "eq", "value": True}
-        ],
-        "logic": "and"
-    })
-    combined_alarms = combined_alarm_data['combined_alarm'].sum()
-    print(f"Combined alarms: {combined_alarms}")
-    
-    # 10. 低通滤波
-    filtered_data, _ = REGISTRY.execute("LowPassFilter", combined_alarm_data, {
-        "field": "value",
-        "cutoff": 0.1,
-        "order": 4
-    })
-    print("After low-pass filter:", filtered_data.columns.tolist())
-    
-    # 11. 数据聚合
-    agg_data, _ = REGISTRY.execute("Aggregator", filtered_data, {
-        "time_field": "time",
-        "value_fields": ["value", "value_filtered"],
-        "interval": "5min",
-        "method": "mean"
-    })
-    print("After aggregation shape:", agg_data.shape)
-    
-    # 12. FFT频谱分析
-    try:
-        fft_data, _ = REGISTRY.execute("FourierTransform", test_data, {
-            "field": "value",
-            "sampling_rate": 1.0,
-            "output_type": "magnitude"
-        })
-        print("FFT analysis shape:", fft_data.shape)
-    except Exception as e:
-        print(f"FFT analysis skipped: {e}")
-    
-    # 13. 导出CSV
-    try:
-        REGISTRY.execute("CSVExporter", agg_data, {
-            "file_path": "./processed_data.csv",
-            "index": False
-        })
-        print("Data exported to CSV")
-    except Exception as e:
-        print(f"CSV export failed: {e}")
-    
-    # 列出所有注册的函数
-    print(f"\nTotal registered functions: {len(REGISTRY.list_all())}")
-    print("\nRegistered functions by category:")
-    for category in FunctionCategory:
-        functions = REGISTRY.get_by_category(category)
-        if functions:
-            print(f"\n{category.value.upper()}:")
-            for func_name in functions:
-                func_cls = REGISTRY.get(func_name)
-                print(f"  - {func_name}: {func_cls.metadata.description}")
-    
-    print(f"\nExample processing complete! Original data: {len(test_data)} rows -> Aggregated: {len(agg_data)} rows")
